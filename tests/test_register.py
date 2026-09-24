@@ -429,23 +429,42 @@ def test_model_review_fixes():
           "balance_a,cashflow_q,estimates,income_a,income_q,profile,quote")
 
 
-def test_run_from_data_returns_one_frame():
-    """The public entry point on the synthetic universe: one DataFrame, every
-    stage of the chain present, run health in attrs."""
+def test_output_is_the_125_columns():
+    """The public entry point returns exactly the 125 documented columns, and
+    each one carries the model's own value."""
     blobs = _universe()
     bench = {r["date"]: r["close"] for r in blobs["S00"]["ohlcv"]}
     data = {t: {"blob": b, "ohlcv": b["ohlcv"], "mcap_hist": {}} for t, b in blobs.items()}
     df = E.run_from_data(data, bench, workers=4)
-    assert isinstance(df, pd.DataFrame) and len(df) == len(blobs)
-    for col in ("v1_ebit_ev", "pct_v1_ebit_ev", "pct_v1_ebit_ev__S", "value_raw", "quality_raw",
-                "biz_raw", "price_raw", "v_rank_u", "q_rank_s", f"composite_rank_{C.BASE_PROFILE}",
-                "gated", "safety", "flag_GATE", "grp", "checklist_passes", "workings",
-                "rev_ttm", "gp_ttm", "net_margin_5y_avg", "vol_yoy_q0"):
-        assert col in df.columns, col
-    assert df[f"composite_rank_{C.BASE_PROFILE}"].dropna().is_monotonic_decreasing
+    assert list(df.columns) == E.COLUMNS and len(E.COLUMNS) == 125
+    assert len(df) == len(blobs)
+    assert df["rank"].dropna().is_monotonic_decreasing
     for k in ("failed", "excluded_entry_rule", "groups", "market_vitals", "blank_share"):
         assert k in df.attrs, k
+
+    full = E._run_full(data, bench, workers=4).set_index("symbol")
+    out = df.set_index("symbol").loc[full.index]
+    same = lambda a, b: bool(((a == b) | (a.isna() & b.isna())).all())
+    for key, name in E.METRIC_NAMES.items():
+        assert same(out[name], full[key]), name
+        assert same(out[f"u_{name}"], full[f"pct_{key}"]), name
+        assert same(out[f"s_{name}"], full[f"pct_{key}__S"]), name
+    for col, src in (("V", "v_rank_u"), ("Q_raw", "quality_raw"), ("P_raw", "price_raw"),
+                     ("composite", f"composite_raw_{C.BASE_PROFILE}"),
+                     ("rank", f"composite_rank_{C.BASE_PROFILE}"), ("safety_score", "safety_raw"),
+                     ("net_debt_to_ebit", "nd_ebit"), ("accruals", "hyg_accruals")):
+        assert same(out[col], full[src]), col
+    assert (out["safety_grade"] == full["safety"]).all()
+    # every gated name names its gate, and no ungated name does
+    assert ((out["gated"] == 1) == (out["gates"] != "")).all()
+    # short_history_metrics is filled exactly when short_history is on
+    assert ((out["short_history"] == 1) == (out["short_history_metrics"] != "")).all()
+
     with pytest.raises(ValueError):
         E.run_from_data(data, bench, profile="NOPE")
-    again = E.run_from_data(data, bench, previous_flags=df, workers=4)
-    assert len(again) == len(df)
+    # yesterday's output feeds hysteresis directly
+    prev = df.copy()
+    prev["flags"] = "HYGIENE"
+    held = E.run_from_data(data, bench, previous_flags=prev, workers=4).set_index("symbol")
+    band = (full["q6_hygiene_pct"] >= C.HYGIENE_ON) & (full["q6_hygiene_pct"] < C.HYGIENE_OFF)
+    assert held.loc[band[band].index, "flags"].str.contains("HYGIENE").all()

@@ -17,9 +17,9 @@ applied afterwards and never add score. Every rank runs from 0 to 100, and
 **100 is best**.
 
 You pass in a list of tickers and your FMP API key. You get back **one pandas
-DataFrame** with one row per stock. It holds every source figure, metric,
-percentile, pillar score, rank, gate, flag, grade and checklist item the
-model produces.
+DataFrame** with one row per stock and 125 columns: identity, the 20 metrics,
+their universe and sector percentiles, blocks and pillars, composites,
+overlays and context.
 
 ---
 
@@ -39,8 +39,7 @@ import vqmb
 
 df = vqmb.run(["AAPL", "MSFT", "NVDA", "JPM", "PGR", "XOM"], api_key="YOUR_FMP_KEY")
 
-df[["symbol", "composite_rank_TRADER", "v_rank_u", "q_rank_u", "b_rank_u", "p_rank_u",
-    "safety", "flags"]]
+df[["symbol", "rank", "V", "Q", "B", "P", "gated", "flags", "safety_grade"]]
 ```
 
 If you leave out `api_key`, the library reads the `FMP_API_KEY` environment
@@ -67,22 +66,20 @@ value to be ranked. Sector ranks and the financials splice each need at least
 
 ## API
 
-### `vqmb.run(tickers, api_key=None, *, profile="TRADER", previous_flags=None, workers=8, cache_dir=None, refresh=False, include_price_history=False, include_source_data=False)`
+### `vqmb.run(tickers, api_key=None, *, profile="TRADER", previous_flags=None, workers=8, cache_dir=None, refresh=False)`
 
-Fetches everything from FMP and scores the list. Returns a DataFrame sorted by
-the chosen profile's composite rank, best first.
+Fetches everything from FMP and scores the list. Returns the 125-column
+DataFrame, sorted by `rank`, best first.
 
 | Argument | Meaning |
 |---|---|
 | `tickers` | A list of symbols, or one comma-separated string. They are upper-cased and de-duplicated. |
 | `api_key` | Your FMP key. Falls back to `FMP_API_KEY`. |
-| `profile` | `"TRADER"`, `"PM"` or `"GROWTH"`. Sets the sort order and which profile the `grp` / `group_*` columns use. All three composites are always computed. |
-| `previous_flags` | The DataFrame from an earlier run, or any table with a `symbol` column plus flag columns. Gives the HYGIENE, DISCRETE and CONFLICT flags their hysteresis (see Flags). Without it, every flag uses its ON threshold. |
+| `profile` | `"TRADER"`, `"PM"` or `"GROWTH"`. The active profile: it fills `composite`, `rank` and `green`, and sets the sort order. All three composites are always computed. |
+| `previous_flags` | The DataFrame from an earlier run (its `flags` column is read). Gives the HYGIENE, DISCRETE and CONFLICT flags their hysteresis (see Flags). Without it, every flag uses its ON threshold. |
 | `workers` | Number of parallel threads. |
 | `cache_dir` | An optional folder for raw FMP responses. Fundamentals are reused for 1 day and market-cap history for 7 days. Prices are always fetched fresh. There is no caching by default. |
 | `refresh` | Ignore cached fundamentals. |
-| `include_price_history` | Adds a `price_history` column with the full daily series (dates, closes, highs, lows, volumes). |
-| `include_source_data` | Adds a `source_data` column with the raw FMP responses (after aliasing and currency normalisation). |
 
 It raises `vqmb.VQMBError` instead of returning numbers that can't be trusted:
 
@@ -105,141 +102,114 @@ Progress and warnings go to the standard `logging` logger named `"vqmb"`.
 
 ## The output DataFrame
 
-One row per scored name. It has about 310 columns, grouped below. Blank
-(`NaN`) always means "not computable". The model never fills a blank with
-zero. A blank metric drops out, and the other metrics in its sub-block are
-averaged without it.
+`vqmb.run()` returns exactly **125 columns**, one row per scored name, sorted
+by `rank` (best first). The list is `vqmb.engine.COLUMNS`. Blank (`NaN`)
+always means "not computable". The model never fills a blank with zero. A
+blank metric drops out, and the other metrics in its sub-block are averaged
+without it. Flag-like columns are `1`/`0`. Multi-value text columns are
+pipe-separated.
 
-### Headline
+### Identity (8)
+
+`symbol`, `company`, `sector`, `industry`, `country`, `price` (latest close),
+`mktcap`, `fin_mode`.
+
+`fin_mode` is `1` when the financials variant applies. That covers banks,
+lenders and insurers only. Exchanges, asset managers, brokers and payment
+networks stay on the standard set.
+
+### Ranked metrics, raw values (20)
+
+| Block | Columns |
+|---|---|
+| Value | `ebit_to_ev`, `ev_to_gp`↓, `fwd_earn_yield`, `normalized_ep`, `ev_sales_vs_hist`↓ |
+| Quality – engine | `roic`, `roiic`, `growth_persistence` |
+| Quality – shield | `leverage_score`, `drawdown_history`↓, `hygiene` |
+| Business momentum | `latest_q_vs_3y`, `seq_accel`, `gm_change_yoy` |
+| Price – strength | `trend_12_1`, `trend_6_1`, `dist_from_high` |
+| Price – credibility | `continuity`, `lottery_days`↓, `down_resilience` |
+
+↓ = lower is better. For `ev_to_gp`, the financials variant is book/price,
+and there higher is better.
+
+### Percentiles (40)
+
+- `u_<metric>`: the universe percentile, 0–100, where 100 is always best.
+  This is what feeds the score. For the 12 variant metrics, financials are
+  ranked only against other financials.
+- `s_<metric>`: the sector percentile. It is diagnostic only. Sectors with
+  fewer than 12 names fall back to the universe percentile. For financials,
+  `s_` equals `u_` by construction on the variant metrics.
+
+### Blocks and pillars (16)
 
 | Column | Meaning |
 |---|---|
-| `symbol`, `company`, `sector`, `industry` | Identity (FMP profile). |
-| `group` | One of the industry groups, after merging any group with under 12 members into its neighbour. `group_raw` is the group before merging. |
-| `composite_rank_TRADER` / `_PM` / `_GROWTH` | Composite rank, 0–100, for each profile. |
-| `v_rank_u`, `q_rank_u`, `b_rank_u`, `p_rank_u` | Pillar ranks against the whole universe (U). |
-| `v_rank_s`, `q_rank_s`, `b_rank_s`, `p_rank_s` | Pillar ranks within the sector (S). |
-| `grp` | Group strength for the chosen profile. |
-| `ad` | Accumulation/distribution grade A–E, by universe quintile. |
-| `safety` | Safety grade A–E. Any gate forces E. |
-| `darvas`, `darvas_stack` | Darvas box state: `BOX`, `BRK UP`, `BRK DOWN` or `DRIFT`, plus `STACK xN`. |
-| `flags` | The two most severe active flags. |
-| `gated`, `gate_cause` | Whether a gate applies, and why. |
-| `checklist_passes` | Count of PASS results on the 10-item checklist. |
-| `triple`, `green_TRADER` / `_PM` / `_GROWTH` | Conviction marks. |
+| `blk_value` | Mean of the V1–V5 percentiles. |
+| `blk_q_engine` | Mean of the Q1–Q3 percentiles. |
+| `blk_q_shield` | Mean of the Q4–Q6 percentiles. |
+| `blk_b_mom` | Mean of the B1–B3 percentiles. |
+| `blk_p_strength` | Mean of the P1–P3 percentiles. |
+| `blk_p_cred` | Mean of the P4–P6 percentiles. |
+| `shield_dampener` | `0.6 + 0.4 × shield/100`. A blank shield counts as 50. |
+| `credibility_dampener` | `0.5 + 0.5 × credibility/100`. A blank credibility counts as 50. |
+| `V_raw`, `B_raw` | Equal to `blk_value` and `blk_b_mom`. |
+| `Q_raw` | `blk_q_engine × shield_dampener`. |
+| `P_raw` | `blk_p_strength × credibility_dampener`. |
+| `V`, `Q`, `B`, `P` | The pillar raw scores re-ranked 0–100 against the universe. |
 
-### Metric raw values (the 20 ranked metrics)
-
-| Pillar | Columns |
-|---|---|
-| Value | `v1_ebit_ev`, `v2_ev_gp`, `v3_fwd_earn_yield`, `v4_norm_ep`, `v5_ev_sales_vs_hist` |
-| Quality – engine | `q1_roic`, `q2_roiic`, `q3_persistence` |
-| Quality – shield | `q4_leverage_score`, `q5_drawdown`, `q6_hygiene` (with its components `hyg_accruals`, `hyg_dilution`, `hyg_bloat`) |
-| Business momentum | `b1_vs_trend`, `b2_sequential`, `b3_margin_delta` |
-| Price – strength | `p1_trend_12_1`, `p2_trend_6_1`, `p3_high_distance` |
-| Price – credibility | `p4_continuity`, `p5_lottery`, `p6_down_resilience` |
-
-Tags on each metric: `v3_calc`, `v3_loss`, `v3_calc_na`, `fwd_basis`,
-`ntm_coverage`, `ntm_blend`, `q1_used_gpa_fallback`, `leverage_gate`,
-`is_fin`, `fin_kind`.
-
-### Percentiles
-
-- `pct_<metric>` is the metric's universe percentile.
-- `pct_<metric>__S` is its sector percentile.
-- `pct_hyg_*_pct` are the three hygiene component percentiles.
-- `q6_hygiene_pct` is the percentile of the hygiene composite.
-
-### Pillars and composites
+### Composite (9)
 
 | Column | Meaning |
 |---|---|
-| `value_raw` | Mean of the V1–V5 percentiles. |
-| `quality_engine`, `quality_shield` | Mean of the Q1–Q3 and Q4–Q6 percentiles. |
-| `quality_damp`, `quality_raw` | `quality_damp = 0.6 + 0.4 × shield/100`, and `quality_raw = engine × quality_damp`. |
-| `biz_raw` | Mean of the B1–B3 percentiles. |
-| `price_strength`, `price_credibility` | Mean of the P1–P3 and P4–P6 percentiles. |
-| `price_damp`, `price_raw` | `price_damp = 0.5 + 0.5 × credibility/100`, and `price_raw = strength × price_damp`. |
-| `composite_raw_<PROFILE>` | Profile-weighted mean of the pillar U ranks. |
-| `pillars_present`, `thin` | How many pillars were scored. `thin` means fewer than 2. |
+| `profile` | The active profile, set by `run(profile=...)`. |
+| `composite`, `rank` | The active profile's weighted score, and that score re-ranked 0–100. |
+| `composite_TRADER` / `_PM` / `_GROWTH` | Weighted score for each profile. |
+| `rank_TRADER` / `_PM` / `_GROWTH` | Each profile's score re-ranked 0–100. |
 
-### Overlays
+A name needs at least 2 of the 4 pillars to get a composite. Otherwise it is
+blank and flagged THIN.
+
+### Overlays (9)
 
 | Column | Meaning |
 |---|---|
-| `safety_raw` | `0.6 × shield + 0.4 × drawdown percentile`. |
-| `nd_ebit`, `ebit_negative_with_net_debt`, `capital_ratio` | Gate inputs. |
-| `leverage_ok`, `grp_base` | Checklist inputs. |
-| `chk::<item>` | PASS, NEUTRAL or FAIL for each of the 10 checklist items. |
-| `flag_<NAME>` | Every flag as a boolean. `flag_pillar_spread` is the gap between the highest and lowest pillar rank. |
-| `ad_ratio` | Raw up-volume ÷ down-volume. |
-| `box_top`, `box_floor`, `days_in_box`, `tightness`, `stack` | Darvas box detail. |
-| `group_n`, `group_median_composite`, `group_median_price_rank`, `group_iqr`, `group_strength` | The name's row of the group table. |
+| `gated` | `1` when a gate applies. |
+| `gates` | Which gates fired: `LEVERAGE` (ND/EBIT > 4×), `NO_EARNINGS` (reported EBIT ≤ 0 with net debt), `BANK_CAPITAL` (equity/assets < 5%), `INSURER_CAPITAL` (< 8%). |
+| `flags` | Every active flag, most severe first: FX, THIN, STALE, HYGIENE, DISCRETE, CONFLICT, SHORT_HISTORY, LOSS, CALC, NOGP, GPA, PXCHK, WKCHK, FIN. |
+| `pillar_spread` | Highest pillar rank minus lowest. |
+| `safety_score` | `0.6 × shield + 0.4 × drawdown percentile`. |
+| `safety_grade` | A–E on absolute bands (85 / 70 / 50 / 30). Any gate forces E. |
+| `ad_grade` | A–E by universe quintile of `ad_ratio`. |
+| `green` | `1` = top 5% of the active profile, at least 8 points above the median composite, and not gated. |
+| `triple` | `1` = top decile on all three profiles, and not gated. |
 
-### Source figures and intermediate calculations (the fact sheet)
+### Context, never ranked (23)
 
-TTM and annual statement figures:
+| Column | Meaning |
+|---|---|
+| `ev` | Market cap + total debt − cash & short-term investments. |
+| `net_debt` | Total debt − cash & short-term investments. |
+| `equity_to_assets` | The capital ratio. |
+| `ntm_coverage` | How much of the next 12 months the estimate rows span. |
+| `fwd_basis` | `ntm` = blended across fiscal years. `fy_fallback` = coverage under 80%, so the nearest fiscal year that hasn't ended was used. `none` = no usable consensus (including fewer than 3 analysts). |
+| `fwd_rev_basis` | The same basis flag, for revenue. |
+| `ntm_blend` | The fiscal-year weights actually used, e.g. `31% FY2026 + 69% FY2027`. |
+| `fwd_rev_ntm` | Blended next-twelve-month revenue. |
+| `fwd_eps_ntm` | Blended next-twelve-month EPS. |
+| `fwd_rev_growth` | NTM revenue against TTM revenue. |
+| `fwd_eps_growth` | NTM EPS against TTM EPS. |
+| `fwd_pe` | Price ÷ NTM EPS. Blank when the EPS is ≤ 0. |
+| `ad_ratio` | Up-day volume ÷ down-day volume over 50 sessions. |
+| `rev_yoy_ttm` | TTM revenue growth; `g` in the modelled forward yield. |
+| `fwd_earn_yield_calc` | `0` = consensus. `1` = modelled, because there was no usable consensus (the value can still be blank). `2` = blank because consensus forecasts a loss. |
+| `net_debt_to_ebit` | Net debt ÷ TTM EBIT. Negative means net cash. Blank when EBIT ≤ 0. |
+| `accruals`, `dilution`, `bs_bloat` | The three raw hygiene components. For all three, higher is worse. |
+| `rev_cagr_3y`, `rev_yoy_q0` | The two legs of `latest_q_vs_3y`, measured on the volume line: revenue for most companies, pre-provision profit for banks and lenders. |
+| `short_history` | `1` when a history minimum isn't met. |
+| `short_history_metrics` | Which of `drawdown_history`, `growth_persistence` and `ev_sales_vs_hist` are short of history. |
 
-- `rev_ttm`, `gp_ttm`, `ebit_ttm`, `ni_ttm`, `cfo_ttm`, `sbc_ttm`
-- `rev_ttm_prior`, `rev_a0`, `rev_3y`, `shares_a0`, `shares_3y`, `shares_now`
-
-Balance sheet and valuation:
-
-- `price`, `mcap`, `ev`, `net_debt`, `book`, `book_tangible`, `assets`,
-  `assets_3y`, `invested_capital`
-
-Tax, NOPAT and history:
-
-- `effective_tax_rate`, `d_nopat_3y`, `d_ic_3y`, `d_ni_3y`, `d_book_3y`
-- `net_margin_5y_avg`, `margin_years`, `roe_5y_avg`, `roe_years`
-
-Forward estimates:
-
-- `ntm_eps`, `fwd_rev`, `analyst_count`, `thin_consensus`, `g_projection`
-
-Business-momentum inputs:
-
-- `vol_yoy_q0`, `vol_yoy_q1`, `vol_cagr_3y`, `volume_quarters`
-- `persistence_hits`, `persistence_quarters`
-- `gm_q0`, `gm_q4`, `fin_margin_q0`, `fin_margin_q4`, `fin_margin_basis`
-
-Own-history medians and price inputs:
-
-- `ev_sales_median_hist` / `pb_median_hist`, `high_252`
-- `monthly_returns_12_1`, `monthly_returns_6_1`, `daily_returns_252`
-- `pct_up_days`, `pct_down_days`, `period_return_sign`, `returns_on_down_days`
-- `dd_episodes`, `dd_worst`, `price_years`, `dollar_volume`
-
-Data-quality fields:
-
-- `cadence`, `ttm_n`, `yoy_lag`, `gapped`, `stale_statement`,
-  `statement_age_days`, `price_age_days`
-- `gp_quality`, `gp_set_aside`, `cf_aligned`, `currency`, `fx_mismatch`,
-  `price_stale`, `stale`, `stale_reason`, `px_mismatch`, `implausible_moves`,
-  `short_history`
-
-Context columns (never ranked):
-
-- `ctx_rev_cagr_3y`, `ctx_rev_yoy_ttm`, `ctx_rev_accel`, `ctx_gp_growth_ttm`
-- `ctx_fwd_rev_growth`, `ctx_fwd_eps_growth`, `ctx_persistence`,
-  `ctx_gross_margin`, `ctx_fcf_margin`
-
-Statement lines behind each calculation, prefixed `w_`:
-
-- The quarters in each TTM sum (`w_q`) and each year's margin and ROE
-  (`w_margin_years`, `w_roe_years`)
-- The fiscal years blended into NTM EPS (`w_ntm_parts`) and the historical
-  EV/sales or P/B points (`w_hist_points`)
-
-### Workings
-
-`workings` holds a dict per name: one entry per metric, containing the formula,
-every raw input, the result, and an `ok` field. `ok` records whether
-recomputing the metric from its displayed inputs reproduces the ranked value.
-`workings_mismatch` and `workings_mismatch_keys` summarise those checks, and
-a mismatch raises the WKCHK flag.
-
-### `df.attrs` (run-level information)
+### `df.attrs` (run-level information, not columns)
 
 | Key | Meaning |
 |---|---|
@@ -248,12 +218,12 @@ a mismatch raises the WKCHK flag.
 | `failed` | `(ticker, error)` for names that could not be scored. |
 | `excluded_entry_rule` | Names dropped for having under 1 year of prices. |
 | `folded_share_classes` | Duplicate share classes that were folded (e.g. GOOG into GOOGL). |
-| `merged_groups` | Groups under 12 members and the group each was merged into. |
+| `merged_groups` | Industry groups under 12 members and the group each was merged into. |
 | `blank_share` | Share of blanks for each metric. |
 | `data_flags` | Counts of NOGP, GPA, FX, STALE, THIN, PXCHK, WKCHK and CALC. |
 | `cadence` | Count of quarterly vs half-yearly reporters. |
 | `workings_mismatch`, `implausible_moves` | Names listed for review. |
-| `groups` | The group table: N, median composite, median price rank, IQR, GRP. |
+| `groups` | The industry-group table. |
 | `market_vitals` | Seven universe-wide readings, each with a value and a verdict. |
 
 ---

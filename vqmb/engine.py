@@ -45,9 +45,7 @@ class VQMBError(RuntimeError):
     """The run stopped rather than return numbers that cannot be trusted."""
 
 
-# fact-sheet keys holding the full daily price series. Kept out of the default
-# output because each is ~1,260 values per name; include_price_history=True
-# returns them in one `price_history` column instead.
+# fact-sheet keys holding the full daily price series (~1,260 values per name)
 _SERIES_KEYS = ("_dates", "_closes", "_highs", "_lows", "_volumes")
 
 # the fact-sheet fields the original row carries, copied in this order
@@ -355,13 +353,22 @@ def _clean_tickers(tickers: Iterable[str]) -> list[str]:
 
 
 def _previous_state(previous) -> pd.DataFrame | None:
-    """Accept a previous vqmb.run() result (flag_* columns) or a table of
-    symbol + bare flag names, and return symbol + bare flag names."""
+    """Accept a previous vqmb.run() output (its pipe-separated `flags`
+    column), or a table of symbol + one boolean column per flag, and return
+    symbol + bare flag names."""
     if previous is None:
         return None
     prev = pd.DataFrame(previous)
     if "symbol" not in prev.columns:
         raise ValueError("previous_flags needs a 'symbol' column")
+    if "flags" in prev.columns and not any(
+            f"flag_{fl}" in prev.columns or fl in prev.columns for fl in C.FLAG_SEVERITY):
+        # a previous vqmb.run() output: `flags` is a pipe-separated list
+        on = prev["flags"].fillna("").astype(str).str.split("|")
+        state = pd.DataFrame({"symbol": prev["symbol"]})
+        for fl in C.FLAG_SEVERITY:
+            state[fl] = on.apply(lambda xs, fl=fl: fl in xs)
+        return state.drop_duplicates("symbol", keep="last")
     cols = {}
     for fl in C.FLAG_SEVERITY:
         if f"flag_{fl}" in prev.columns:
@@ -372,26 +379,174 @@ def _previous_state(previous) -> pd.DataFrame | None:
     return state.drop_duplicates("symbol", keep="last")
 
 
-_LEAD_COLUMNS = (["symbol", "company", "sector", "industry", "group"]
-                 + [f"composite_rank_{p}" for p in C.PROFILES]
-                 + ["v_rank_u", "q_rank_u", "b_rank_u", "p_rank_u",
-                    "v_rank_s", "q_rank_s", "b_rank_s", "p_rank_s", "grp", "ad",
-                    "safety", "darvas", "darvas_stack", "flags", "gated", "gate_cause",
-                    "checklist_passes", "triple"]
-                 + [f"green_{p}" for p in C.PROFILES])
+# ---------------------------------------------------------------------------
+# the output: 125 columns
+# ---------------------------------------------------------------------------
+# model metric key -> output column name
+METRIC_NAMES = {
+    "v1_ebit_ev": "ebit_to_ev",
+    "v2_ev_gp": "ev_to_gp",
+    "v3_fwd_earn_yield": "fwd_earn_yield",
+    "v4_norm_ep": "normalized_ep",
+    "v5_ev_sales_vs_hist": "ev_sales_vs_hist",
+    "q1_roic": "roic",
+    "q2_roiic": "roiic",
+    "q3_persistence": "growth_persistence",
+    "q4_leverage_score": "leverage_score",
+    "q5_drawdown": "drawdown_history",
+    "q6_hygiene": "hygiene",
+    "b1_vs_trend": "latest_q_vs_3y",
+    "b2_sequential": "seq_accel",
+    "b3_margin_delta": "gm_change_yoy",
+    "p1_trend_12_1": "trend_12_1",
+    "p2_trend_6_1": "trend_6_1",
+    "p3_high_distance": "dist_from_high",
+    "p4_continuity": "continuity",
+    "p5_lottery": "lottery_days",
+    "p6_down_resilience": "down_resilience",
+}
+
+COLUMNS = (
+    ["symbol", "company", "sector", "industry", "country", "price", "mktcap", "fin_mode"]
+    + list(METRIC_NAMES.values())
+    + [f"u_{n}" for n in METRIC_NAMES.values()]
+    + [f"s_{n}" for n in METRIC_NAMES.values()]
+    + ["blk_value", "blk_q_engine", "blk_q_shield", "blk_b_mom", "blk_p_strength", "blk_p_cred",
+       "shield_dampener", "credibility_dampener", "V_raw", "Q_raw", "B_raw", "P_raw",
+       "V", "Q", "B", "P",
+       "profile", "composite", "rank"]
+    + [f"composite_{p}" for p in C.PROFILES]
+    + [f"rank_{p}" for p in C.PROFILES]
+    + ["gated", "gates", "flags", "pillar_spread", "safety_score", "safety_grade", "ad_grade",
+       "green", "triple",
+       "ev", "net_debt", "equity_to_assets", "ntm_coverage", "fwd_basis", "fwd_rev_basis",
+       "ntm_blend", "fwd_rev_ntm", "fwd_eps_ntm", "fwd_rev_growth", "fwd_eps_growth", "fwd_pe",
+       "ad_ratio", "rev_yoy_ttm", "fwd_earn_yield_calc", "net_debt_to_ebit", "accruals",
+       "dilution", "bs_bloat", "rev_cagr_3y", "rev_yoy_q0", "short_history",
+       "short_history_metrics"]
+)
 
 
-def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
-                  previous_flags=None, workers: int = 8,
-                  include_price_history: bool = False,
-                  include_source_data: bool = False) -> pd.DataFrame:
-    """Score data already in hand - no API calls.
+def _gates(r) -> str:
+    """Every gate that fired, by the same rules ranking.apply_gates applies."""
+    out = []
+    operating = not bool(r.get("is_fin"))
+    nd_ebit = M._f(r.get("nd_ebit"))
+    if operating and nd_ebit > C.LEVERAGE_GATE_ND_EBIT:
+        out.append("LEVERAGE")
+    if operating and bool(r.get("ebit_negative_with_net_debt")):
+        out.append("NO_EARNINGS")
+    cap = M._f(r.get("capital_ratio"))
+    if r.get("fin_kind") in ("bank", "nbfc") and cap < C.BANK_CAPITAL_GATE:
+        out.append("BANK_CAPITAL")
+    if r.get("fin_kind") == "insurer" and cap < C.INSURER_CAPITAL_GATE:
+        out.append("INSURER_CAPITAL")
+    if not out and bool(r.get("gated")):
+        out.append(str(r.get("gate_cause") or "GATED"))
+    return "|".join(out)
 
-    data: {ticker: {"blob": statement blob as fmp.fetch_ticker returns it,
-                    "ohlcv": daily bars, "mcap_hist": {date: market cap}}}
-    benchmark: {date: close} for SPY.
-    Other arguments as run().
-    """
+
+def _flags(r) -> str:
+    """Every active flag, most severe first. GATE is reported in gated/gates."""
+    return "|".join(fl for fl in C.FLAG_SEVERITY
+                    if fl != "GATE" and bool(r.get(f"flag_{fl}")))
+
+
+def _short_history_metrics(r) -> str:
+    """Which metrics the SHORT_HISTORY test found short of history - the same
+    three conditions metrics.compute_all tests."""
+    out = []
+    if not M._has_at_least(r.get("price_years"), C.DRAWDOWN_MIN_YEARS):
+        out.append("drawdown_history")
+    if not M._has_at_least(r.get("persistence_quarters"), r.get("persistence_window", 8)):
+        out.append("growth_persistence")
+    med = r.get("pb_median_hist") if r.get("is_fin") else r.get("ev_sales_median_hist")
+    if not M._ok(M._f(med)):
+        out.append("ev_sales_vs_hist")
+    return "|".join(out)
+
+
+def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
+    """Project the full scored frame onto the 125 output columns."""
+    nan = pd.Series(np.nan, index=full.index)
+    num = lambda c: pd.to_numeric(full[c] if c in full.columns else nan, errors="coerce")
+    flag = lambda c: (full[c] if c in full.columns else pd.Series(False, index=full.index)) \
+        .fillna(False).astype(bool).astype(int)
+    rows = [r for _, r in full.iterrows()]
+    out = {}                                     # built as one frame at the end
+    out["symbol"] = full["symbol"]
+    for c in ("company", "sector", "industry", "country"):
+        out[c] = full[c] if c in full.columns else None
+    out["price"] = num("price")
+    out["mktcap"] = num("mcap")
+    out["fin_mode"] = flag("is_fin")
+    for key, name in METRIC_NAMES.items():
+        out[name] = num(key)
+    for key, name in METRIC_NAMES.items():
+        out[f"u_{name}"] = num(f"pct_{key}")
+    for key, name in METRIC_NAMES.items():
+        out[f"s_{name}"] = num(f"pct_{key}__S")
+    for col, src in (("blk_value", "value_raw"), ("blk_q_engine", "quality_engine"),
+                     ("blk_q_shield", "quality_shield"), ("blk_b_mom", "biz_raw"),
+                     ("blk_p_strength", "price_strength"), ("blk_p_cred", "price_credibility"),
+                     ("shield_dampener", "quality_damp"), ("credibility_dampener", "price_damp"),
+                     ("V_raw", "value_raw"), ("Q_raw", "quality_raw"), ("B_raw", "biz_raw"),
+                     ("P_raw", "price_raw"), ("V", "v_rank_u"), ("Q", "q_rank_u"),
+                     ("B", "b_rank_u"), ("P", "p_rank_u")):
+        out[col] = num(src)
+    out["profile"] = profile
+    out["composite"] = num(f"composite_raw_{profile}")
+    out["rank"] = num(f"composite_rank_{profile}")
+    for p in C.PROFILES:
+        out[f"composite_{p}"] = num(f"composite_raw_{p}")
+    for p in C.PROFILES:
+        out[f"rank_{p}"] = num(f"composite_rank_{p}")
+    out["gated"] = flag("gated")
+    out["gates"] = [_gates(r) for r in rows]
+    out["flags"] = [_flags(r) for r in rows]
+    out["pillar_spread"] = num("flag_pillar_spread")
+    out["safety_score"] = num("safety_raw")
+    out["safety_grade"] = full["safety"]
+    out["ad_grade"] = full["ad"]
+    out["green"] = flag(f"green_{profile}")
+    out["triple"] = flag("triple")
+    out["ev"] = num("ev")
+    out["net_debt"] = num("net_debt")
+    out["equity_to_assets"] = num("capital_ratio")
+    out["ntm_coverage"] = num("ntm_coverage")
+    out["fwd_basis"] = full["fwd_basis"] if "fwd_basis" in full.columns else None
+    out["fwd_rev_basis"] = full["fwd_rev_basis"] if "fwd_rev_basis" in full.columns else None
+    out["ntm_blend"] = full["ntm_blend"] if "ntm_blend" in full.columns else None
+    out["fwd_rev_ntm"] = num("fwd_rev")
+    out["fwd_eps_ntm"] = num("ntm_eps")
+    out["fwd_rev_growth"] = num("ctx_fwd_rev_growth")
+    out["fwd_eps_growth"] = num("ctx_fwd_eps_growth")
+    eps = out["fwd_eps_ntm"]
+    out["fwd_pe"] = (out["price"] / eps).where(eps > 0)       # meaningless on a forecast loss
+    out["ad_ratio"] = num("ad_ratio")
+    out["rev_yoy_ttm"] = num("rev_yoy_ttm")
+    loss, calc = flag("v3_loss"), flag("v3_calc")
+    out["fwd_earn_yield_calc"] = np.where(loss == 1, 2, np.where(calc == 1, 1, 0))
+    out["net_debt_to_ebit"] = num("nd_ebit")
+    out["accruals"] = num("hyg_accruals")
+    out["dilution"] = num("hyg_dilution")
+    out["bs_bloat"] = num("hyg_bloat")
+    # the two legs of latest_q_vs_3y, on the volume line the model uses
+    out["rev_cagr_3y"] = num("vol_cagr_3y")
+    out["rev_yoy_q0"] = num("vol_yoy_q0")
+    out["short_history"] = flag("short_history")
+    out["short_history_metrics"] = [_short_history_metrics(r) for r in rows]
+    assert list(out) == COLUMNS
+    out = pd.DataFrame(out, index=full.index)
+    out = out.sort_values("rank", ascending=False, na_position="last").reset_index(drop=True)
+    out.attrs = dict(full.attrs)
+    return out
+
+
+def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
+              previous_flags=None, workers: int = 8) -> pd.DataFrame:
+    """The whole chain with every intermediate column kept (about 300). The
+    public functions project this onto the 125 output columns."""
     if profile not in C.PROFILES:
         raise ValueError(f"profile must be one of {', '.join(C.PROFILES)}")
     if not benchmark:
@@ -426,17 +581,8 @@ def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
         raise VQMBError(f"{mism.sum()} of {len(df)} names ({mism.mean():.1%}) have a workings "
                         f"mismatch, above the {C.WORKINGS_MISMATCH_ABORT_SHARE:.0%} limit: {bad[:15]}")
 
-    series = df.pop("_price_series")
-    df = df.rename(columns={"_workings": "workings"})
-
-    # group strength for the chosen profile, and its group table
+    df = df.drop(columns=["_price_series"])
     groups = R.group_layer(df, profile)
-    df = df.copy()
-    df["grp"] = df["group"].map(groups["GRP"]).round(0)
-    for col, src in (("group_n", "N"), ("group_median_composite", "MED_CMP"),
-                     ("group_median_price_rank", "MED_P"), ("group_iqr", "IQR"),
-                     ("group_strength", "GRP")):
-        df[col] = df["group"].map(groups[src])
 
     # every fact-sheet field the rows do not already carry
     extra = {}
@@ -448,18 +594,6 @@ def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
             extra.setdefault(k, {})[i] = v
     if extra:
         df = pd.concat([df, pd.DataFrame(extra, index=df.index)], axis=1)
-    if include_price_history:
-        df["price_history"] = series
-    if include_source_data:
-        df["source_data"] = [
-            {**{k: v for k, v in (data[s].get("blob") or {}).items()},
-             "ohlcv": data[s].get("ohlcv"), "mcap_hist": data[s].get("mcap_hist")}
-            for s in df["symbol"]]
-
-    lead = [c for c in _LEAD_COLUMNS if c in df.columns]
-    df = df[lead + [c for c in df.columns if c not in lead]]
-    df = df.sort_values(f"composite_rank_{profile}", ascending=False,
-                        na_position="last").reset_index(drop=True)
 
     df.attrs = {
         "as_of": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -473,7 +607,7 @@ def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
         "excluded_entry_rule": excluded,
         "folded_share_classes": folded,
         "merged_groups": moved,
-        "blank_share": {k: round(float(pd.to_numeric(df[k], errors="coerce").isna().mean()), 4)
+        "blank_share": {METRIC_NAMES[k]: round(float(pd.to_numeric(df[k], errors="coerce").isna().mean()), 4)
                         for k, _ in C.ALL_METRICS if k in df.columns},
         "data_flags": {fl: int(df.get(f"flag_{fl}", pd.Series(False)).fillna(False).astype(bool).sum())
                        for fl in ("NOGP", "GPA", "FX", "STALE", "THIN", "PXCHK", "WKCHK", "CALC")},
@@ -488,6 +622,20 @@ def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
         "market_vitals": market_vitals(df, profile),
     }
     return df
+
+
+def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
+                  previous_flags=None, workers: int = 8) -> pd.DataFrame:
+    """Score data already in hand - no API calls.
+
+    data: {ticker: {"blob": statement blob as fmp.fetch_ticker returns it,
+                    "ohlcv": daily bars, "mcap_hist": {date: market cap}}}
+    benchmark: {date: close} for SPY.
+    Other arguments as run(). Returns the 125-column DataFrame.
+    """
+    full = _run_full(data, benchmark, profile=profile, previous_flags=previous_flags,
+                     workers=workers)
+    return to_output(full, profile)
 
 
 def fetch_data(tickers: Iterable[str], api_key: str | None = None, workers: int = 8,
@@ -531,9 +679,7 @@ def _key(api_key: str | None) -> str:
 
 def run(tickers: Iterable[str], api_key: str | None = None, *,
         profile: str = C.BASE_PROFILE, previous_flags=None, workers: int = 8,
-        cache_dir: str | os.PathLike | None = None, refresh: bool = False,
-        include_price_history: bool = False,
-        include_source_data: bool = False) -> pd.DataFrame:
+        cache_dir: str | os.PathLike | None = None, refresh: bool = False) -> pd.DataFrame:
     """Score a list of tickers with the VQMB model.
 
     Parameters
@@ -543,8 +689,8 @@ def run(tickers: Iterable[str], api_key: str | None = None, *,
     api_key : str, optional
         Your FMP API key. Falls back to the FMP_API_KEY environment variable.
     profile : "TRADER" | "PM" | "GROWTH"
-        Which profile the output is sorted by and group strength (`grp`) is
-        computed for. All three composites are always computed.
+        The active profile: fills `composite`, `rank` and `green`, and sorts
+        the output. All three composites are always computed.
     previous_flags : DataFrame, optional
         A previous run's output (or any table with `symbol` and the flag
         columns). Gives HYGIENE / DISCRETE / CONFLICT their hysteresis.
@@ -555,15 +701,11 @@ def run(tickers: Iterable[str], api_key: str | None = None, *,
         7 days; prices are always fresh). Default: no caching.
     refresh : bool
         Ignore cached fundamentals and refetch.
-    include_price_history : bool
-        Add a `price_history` column with the full daily series per name.
-    include_source_data : bool
-        Add a `source_data` column with the raw (normalised) FMP responses.
 
     Returns
     -------
     pandas.DataFrame
-        One row per scored name, sorted by the chosen profile's composite rank.
+        The 125 columns in COLUMNS, one row per scored name, sorted by `rank`.
         Run-level information (failures, exclusions, group table, market
         vitals, blank shares) is in `df.attrs`.
     """
@@ -575,5 +717,4 @@ def run(tickers: Iterable[str], api_key: str | None = None, *,
         raise VQMBError("the benchmark price series came back empty")
     data = fetch_data(tickers, api_key, workers=workers, cache_dir=cache_dir, refresh=refresh)
     return run_from_data(data, bench, profile=profile, previous_flags=previous_flags,
-                         workers=workers, include_price_history=include_price_history,
-                         include_source_data=include_source_data)
+                         workers=workers)

@@ -472,7 +472,8 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
 
     f: dict = {"symbol": symbol, "sector": sector, "industry": industry,
                "company": prof.get("companyName"), "is_fin": is_fin,
-               "fin_kind": fin_kind, "currency": prof.get("currency")}
+               "fin_kind": fin_kind, "currency": prof.get("currency"),
+               "country": prof.get("country")}
 
     # row 35 (off until verified): vendor zeros on always-reported fields
     inc_q, inc_a = zero_as_missing(inc_q, is_fin), zero_as_missing(inc_a, is_fin)
@@ -670,10 +671,11 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
     # forward revenue, blended the same way - context only, never ranked
     rev_ntm, rev_cov, _ = ntm_blend(dated, "estimatedRevenueAvg")
     if _ok(rev_ntm) and rev_cov >= 0.80:
-        f["fwd_rev"] = rev_ntm
+        f["fwd_rev"], f["fwd_rev_basis"] = rev_ntm, "ntm"
     else:
         future_r = [(d, e) for d, e in sorted(dated) if d > cutoff]
         f["fwd_rev"] = _f(future_r[0][1].get("estimatedRevenueAvg")) if future_r else NA
+        f["fwd_rev_basis"] = "fy_fallback" if future_r else "none"
 
     # ---- volume line, persistence, acceleration ----
     for r in inc_q:
