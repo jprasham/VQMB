@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vqmb"
+# Python packaging requires a version field; it is fixed and never bumped.
+# Install from the repository's main branch to get the current model.
+version = "0.0.0"
+description = "VQMB: Value, Quality, Business-momentum and price-Momentum stock-ranking model on FMP data"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["vqmb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
