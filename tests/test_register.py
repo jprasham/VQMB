@@ -430,13 +430,13 @@ def test_model_review_fixes():
 
 
 def test_output_is_the_documented_columns():
-    """The public entry point returns exactly the 145 documented columns, and
+    """The public entry point returns exactly the 146 documented columns, and
     each one carries the model's own value."""
     blobs = _universe()
     bench = {r["date"]: r["close"] for r in blobs["S00"]["ohlcv"]}
     data = {t: {"blob": b, "ohlcv": b["ohlcv"], "mcap_hist": {}} for t, b in blobs.items()}
     df = E.run_from_data(data, bench, workers=4)
-    assert list(df.columns) == E.COLUMNS and len(E.COLUMNS) == 145
+    assert list(df.columns) == E.COLUMNS and len(E.COLUMNS) == 146
     assert len(df) == len(blobs)
     assert df["rank"].dropna().is_monotonic_decreasing
     for k in ("failed", "excluded_entry_rule", "groups", "market_vitals", "blank_share"):
@@ -472,6 +472,10 @@ def test_output_is_the_documented_columns():
         assert (out[c] == full[c]).all(), c
         assert out[c].isin(["PASS", "NEUTRAL", "FAIL"]).all(), c
     assert ((out[chk] == "PASS").sum(axis=1) == out["checklist_passes"]).all()
+    # neutral_fill_metrics names exactly the metrics with a blank u_ percentile
+    for name in E.METRIC_NAMES.values():
+        listed = out["neutral_fill_metrics"].str.split("|").apply(lambda xs, n=name: n in xs)
+        assert (listed == out[f"u_{name}"].isna()).all(), name
     # short_history_metrics is filled exactly when short_history is on
     assert ((out["short_history"] == 1) == (out["short_history_metrics"] != "")).all()
 

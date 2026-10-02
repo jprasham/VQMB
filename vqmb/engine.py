@@ -436,7 +436,7 @@ COLUMNS = (
        "ntm_blend", "fwd_rev_ntm", "fwd_eps_ntm", "fwd_rev_growth", "fwd_eps_growth", "fwd_pe",
        "ad_ratio", "rev_yoy_ttm", "fwd_earn_yield_calc", "net_debt_to_ebit", "accruals",
        "dilution", "bs_bloat", "rev_cagr_3y", "rev_yoy_q0", "short_history",
-       "short_history_metrics"]
+       "short_history_metrics", "neutral_fill_metrics"]
 )
 
 
@@ -541,6 +541,13 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     out["rev_yoy_q0"] = num("vol_yoy_q0")
     out["short_history"] = flag("short_history")
     out["short_history_metrics"] = [_short_history_metrics(r) for r in rows]
+    # which ranked metrics had no percentile and so counted as the neutral 50
+    if C.METRIC_NEUTRAL_FILL_ON:
+        blank = {name: num(f"pct_{key}").isna() for key, name in METRIC_NAMES.items()}
+        out["neutral_fill_metrics"] = ["|".join(n for n, b in blank.items() if b.iloc[i])
+                                       for i in range(len(full))]
+    else:
+        out["neutral_fill_metrics"] = ""
     assert list(out) == COLUMNS
     out = pd.DataFrame(out, index=full.index)
     out = out.sort_values("rank", ascending=False, na_position="last").reset_index(drop=True)

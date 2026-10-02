@@ -90,7 +90,11 @@ def percentile_within(df: pd.DataFrame, col: str, group_col: str | None,
 # blanks and reweighting (§13) - one law
 # ---------------------------------------------------------------------------
 def block_mean(pcts: pd.DataFrame, cols: list[str]) -> pd.Series:
-    """Mean of the available percentiles in one sub-block.
+    """Mean of the percentiles in one sub-block.
+
+    With config.METRIC_NEUTRAL_FILL_ON, a blank metric counts as the neutral
+    percentile (50) and the mean runs over every metric in the sub-block. The
+    text below describes the FLUX rule, used when the switch is off.
 
     A blank metric is removed and its siblings reweight equally among
     themselves. A sub-block never borrows weight across the divide - value
@@ -98,6 +102,9 @@ def block_mean(pcts: pd.DataFrame, cols: list[str]) -> pd.Series:
     already a 0-100 percentile, an equal-weight mean of whatever survives IS
     the reweighting rule; nothing further is needed.
     """
+    if C.METRIC_NEUTRAL_FILL_ON:
+        # a metric never computed for anyone is a column of blanks - neutral too
+        return pcts.reindex(columns=cols).fillna(C.METRIC_NEUTRAL_FILL).mean(axis=1)
     have = [c for c in cols if c in pcts.columns]
     if not have:
         return pd.Series(np.nan, index=pcts.index, dtype="float64")

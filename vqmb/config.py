@@ -351,6 +351,15 @@ MISSING_EBIT_GATES = False
 # and worst case in the other
 DAMPENER_NEUTRAL_FILL = 50.0
 
+# A metric that is blank (missing or not computable) inside a pillar counts as
+# a neutral percentile of 50 in its sub-block mean, instead of dropping out and
+# re-averaging the rest. Applies to every sub-block of all four pillars (V,
+# Q engine, Q shield, B, P strength, P credibility). The metric's own u_/s_
+# percentile stays blank, so what was filled is still visible.
+# Deliberate departure from FLUX, which drops the blank. False restores FLUX.
+METRIC_NEUTRAL_FILL_ON = True
+METRIC_NEUTRAL_FILL = 50.0
+
 # row 6 - one line per issuer: dual share classes (GOOG/GOOGL) carry the same
 # statements and would otherwise count twice in every percentile
 FOLD_SHARE_CLASSES = True

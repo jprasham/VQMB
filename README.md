@@ -17,7 +17,7 @@ applied afterwards and never add score. Every rank runs from 0 to 100, and
 **100 is best**.
 
 You pass in a list of tickers and your FMP API key. You get back **one pandas
-DataFrame** with one row per stock and 145 columns: identity, the 20 metrics,
+DataFrame** with one row per stock and 146 columns: identity, the 20 metrics,
 their universe and sector percentiles, blocks and pillars, composites,
 industry group, overlays, the checklist and context.
 
@@ -68,7 +68,7 @@ value to be ranked. Sector ranks and the financials splice each need at least
 
 ### `vqmb.run(tickers, api_key=None, *, profile="TRADER", previous_flags=None, workers=8, cache_dir=None, refresh=False)`
 
-Fetches everything from FMP and scores the list. Returns the 145-column
+Fetches everything from FMP and scores the list. Returns the 146-column
 DataFrame, sorted by `rank`, best first.
 
 | Argument | Meaning |
@@ -102,11 +102,11 @@ Progress and warnings go to the standard `logging` logger named `"vqmb"`.
 
 ## The output DataFrame
 
-`vqmb.run()` returns exactly **145 columns**, one row per scored name, sorted
+`vqmb.run()` returns exactly **146 columns**, one row per scored name, sorted
 by `rank` (best first). The list is `vqmb.engine.COLUMNS`. Blank (`NaN`)
 always means "not computable". The model never fills a blank with zero. A
-blank metric drops out, and the other metrics in its sub-block are averaged
-without it. Flag-like columns are `1`/`0`. Multi-value text columns are
+blank metric keeps a blank `u_`/`s_` percentile, but counts as a neutral 50
+inside its sub-block's average (see `neutral_fill_metrics`). Flag-like columns are `1`/`0`. Multi-value text columns are
 pipe-separated.
 
 ### Identity (8)
@@ -145,7 +145,7 @@ and there higher is better.
 
 | Column | Meaning |
 |---|---|
-| `blk_value` | Mean of the V1–V5 percentiles. |
+| `blk_value` | Mean of the V1–V5 percentiles. In every `blk_` column a blank metric counts as 50. |
 | `blk_q_engine` | Mean of the Q1–Q3 percentiles. |
 | `blk_q_shield` | Mean of the Q4–Q6 percentiles. |
 | `blk_b_mom` | Mean of the B1–B3 percentiles. |
@@ -169,7 +169,8 @@ and there higher is better.
 | `rank_TRADER` / `_PM` / `_GROWTH` | Each profile's score re-ranked 0–100. |
 
 A name needs at least 2 of the 4 pillars to get a composite. Otherwise it is
-blank and flagged THIN.
+blank and flagged THIN. With the neutral fill on, a pillar is never blank (a
+sub-block with every metric blank scores 50), so THIN does not fire.
 
 ### Industry group (4)
 
@@ -215,7 +216,7 @@ set. Column names come from `config.CHECKLIST`.
 | `checklist_passes` | Number of items at `PASS`, 0–10. | |
 | `leverage_ok` | `100` = net cash or ND/EBIT under 1; `0` = ND/EBIT of 1 or more, or a loss with net debt; blank for financials or missing data. | |
 
-### Context, never ranked (23)
+### Context, never ranked (24)
 
 | Column | Meaning |
 |---|---|
@@ -239,6 +240,7 @@ set. Column names come from `config.CHECKLIST`.
 | `rev_cagr_3y`, `rev_yoy_q0` | The two legs of `latest_q_vs_3y`, measured on the volume line: revenue for most companies, pre-provision profit for banks and lenders. |
 | `short_history` | `1` when a history minimum isn't met. |
 | `short_history_metrics` | Which of `drawdown_history`, `growth_persistence` and `ev_sales_vs_hist` are short of history. |
+| `neutral_fill_metrics` | The ranked metrics that were blank and counted as a neutral 50 in their sub-block. Empty when all 20 are present. |
 
 ### `df.attrs` (run-level information, not columns)
 
@@ -267,8 +269,12 @@ use a variant formula for 12 of the metrics, and those metrics rank
 financials only against other financials. The two rankings are then spliced
 into one column.
 
-**Pillars.** A blank metric is removed, and the remaining metrics in its
-sub-block are averaged without it. Weight never moves across sub-blocks.
+**Pillars.** A blank metric counts as a neutral percentile of 50, and every
+sub-block is the equal-weight mean of all its metrics. Example: B1 blank, B2 at
+80, B3 at 60 → business momentum = (50 + 80 + 60) / 3 = 63.3. Weight never
+moves across sub-blocks. This differs from FLUX, which drops a blank and
+averages the rest; `config.METRIC_NEUTRAL_FILL_ON = False` restores the FLUX
+rule.
 Quality = engine × (0.6 + 0.4 × shield/100). Price = strength × (0.5 + 0.5 ×
 credibility/100). Both dampeners can only reduce a score, and a blank shield
 or blank credibility counts as a neutral 50.

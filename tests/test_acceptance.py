@@ -77,8 +77,30 @@ def test_blank_reweighting():
     pcts = pd.DataFrame({"v1_ebit_ev": [80.0], "v2_ev_gp": [60.0],
                          "v3_fwd_earn_yield": [np.nan], "v4_norm_ep": [40.0],
                          "v5_ev_sales_vs_hist": [np.nan]})
-    got = float(R.block_mean(pcts, [k for k, _ in C.VALUE_METRICS]).iloc[0])
-    check("three of five lenses present -> mean of those three", got, 60.0)
+    cols = [k for k, _ in C.VALUE_METRICS]
+    # VQMB rule: each blank lens counts as the neutral 50, mean over all five
+    got = float(R.block_mean(pcts, cols).iloc[0])
+    check("two of five lenses blank -> each counts as 50", got, (80 + 60 + 50 + 40 + 50) / 5)
+    # the FLUX rule is still there behind the switch
+    orig = C.METRIC_NEUTRAL_FILL_ON
+    try:
+        C.METRIC_NEUTRAL_FILL_ON = False
+        got = float(R.block_mean(pcts, cols).iloc[0])
+        check("switch off (FLUX): mean of the three present", got, 60.0)
+    finally:
+        C.METRIC_NEUTRAL_FILL_ON = orig
+
+
+def test_biz_momentum_neutral_fill():
+    cols = [k for k, _ in C.BIZ_METRICS]
+    b = pd.DataFrame({"b1_vs_trend": [np.nan, np.nan, np.nan, 90.0],
+                      "b2_sequential": [80.0, np.nan, np.nan, 70.0],
+                      "b3_margin_delta": [60.0, 30.0, np.nan, 20.0]})
+    got = R.block_mean(b, cols).tolist()
+    check("B1 blank -> (50 + B2 + B3) / 3", got[0], (50 + 80 + 60) / 3)
+    check("B1, B2 blank -> (50 + 50 + B3) / 3", got[1], (50 + 50 + 30) / 3)
+    check("all three blank -> 50", got[2], 50.0)
+    check("none blank -> plain mean", got[3], (90 + 70 + 20) / 3)
 
 
 def test_leverage_curve():
