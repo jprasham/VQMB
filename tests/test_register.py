@@ -429,14 +429,14 @@ def test_model_review_fixes():
           "balance_a,cashflow_q,estimates,income_a,income_q,profile,quote")
 
 
-def test_output_is_the_125_columns():
-    """The public entry point returns exactly the 125 documented columns, and
+def test_output_is_the_documented_columns():
+    """The public entry point returns exactly the 145 documented columns, and
     each one carries the model's own value."""
     blobs = _universe()
     bench = {r["date"]: r["close"] for r in blobs["S00"]["ohlcv"]}
     data = {t: {"blob": b, "ohlcv": b["ohlcv"], "mcap_hist": {}} for t, b in blobs.items()}
     df = E.run_from_data(data, bench, workers=4)
-    assert list(df.columns) == E.COLUMNS and len(E.COLUMNS) == 125
+    assert list(df.columns) == E.COLUMNS and len(E.COLUMNS) == 145
     assert len(df) == len(blobs)
     assert df["rank"].dropna().is_monotonic_decreasing
     for k in ("failed", "excluded_entry_rule", "groups", "market_vitals", "blank_share"):
@@ -452,11 +452,26 @@ def test_output_is_the_125_columns():
     for col, src in (("V", "v_rank_u"), ("Q_raw", "quality_raw"), ("P_raw", "price_raw"),
                      ("composite", f"composite_raw_{C.BASE_PROFILE}"),
                      ("rank", f"composite_rank_{C.BASE_PROFILE}"), ("safety_score", "safety_raw"),
-                     ("net_debt_to_ebit", "nd_ebit"), ("accruals", "hyg_accruals")):
+                     ("net_debt_to_ebit", "nd_ebit"), ("accruals", "hyg_accruals"),
+                     ("s_V", "v_rank_s"), ("s_Q", "q_rank_s"), ("s_B", "b_rank_s"),
+                     ("s_P", "p_rank_s"), ("grp_base", "grp_base"), ("grp", "grp"),
+                     ("checklist_passes", "checklist_passes"), ("leverage_ok", "leverage_ok")):
         assert same(out[col], full[src]), col
     assert (out["safety_grade"] == full["safety"]).all()
-    # every gated name names its gate, and no ungated name does
-    assert ((out["gated"] == 1) == (out["gates"] != "")).all()
+    # every gated name names its gate, and no ungated name does - and the
+    # cause is the one ranking.apply_gates recorded, not a re-derivation
+    assert ((out["gated"] == 1) == (out["gate_cause"] != "")).all()
+    assert (out["gate_cause"] == full["gate_cause"].fillna("")).all()
+    # every name carries its group, and grp is that group's strength
+    assert (out["group"] == full["group"]).all() and (out["group_raw"] == full["group_raw"]).all()
+    grp = {g["group"]: g["GRP"] for g in df.attrs["groups"]}
+    assert same(out["grp"], out["group"].map(grp).round(0)), "grp"
+    # the ten checklist items, as config names them, and the pass count adds up
+    chk = [f"chk::{label}" for label, _, _ in C.CHECKLIST]
+    for c in chk:
+        assert (out[c] == full[c]).all(), c
+        assert out[c].isin(["PASS", "NEUTRAL", "FAIL"]).all(), c
+    assert ((out[chk] == "PASS").sum(axis=1) == out["checklist_passes"]).all()
     # short_history_metrics is filled exactly when short_history is on
     assert ((out["short_history"] == 1) == (out["short_history_metrics"] != "")).all()
 

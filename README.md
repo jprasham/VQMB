@@ -17,9 +17,9 @@ applied afterwards and never add score. Every rank runs from 0 to 100, and
 **100 is best**.
 
 You pass in a list of tickers and your FMP API key. You get back **one pandas
-DataFrame** with one row per stock and 125 columns: identity, the 20 metrics,
+DataFrame** with one row per stock and 145 columns: identity, the 20 metrics,
 their universe and sector percentiles, blocks and pillars, composites,
-overlays and context.
+industry group, overlays, the checklist and context.
 
 ---
 
@@ -68,7 +68,7 @@ value to be ranked. Sector ranks and the financials splice each need at least
 
 ### `vqmb.run(tickers, api_key=None, *, profile="TRADER", previous_flags=None, workers=8, cache_dir=None, refresh=False)`
 
-Fetches everything from FMP and scores the list. Returns the 125-column
+Fetches everything from FMP and scores the list. Returns the 145-column
 DataFrame, sorted by `rank`, best first.
 
 | Argument | Meaning |
@@ -102,7 +102,7 @@ Progress and warnings go to the standard `logging` logger named `"vqmb"`.
 
 ## The output DataFrame
 
-`vqmb.run()` returns exactly **125 columns**, one row per scored name, sorted
+`vqmb.run()` returns exactly **145 columns**, one row per scored name, sorted
 by `rank` (best first). The list is `vqmb.engine.COLUMNS`. Blank (`NaN`)
 always means "not computable". The model never fills a blank with zero. A
 blank metric drops out, and the other metrics in its sub-block are averaged
@@ -141,7 +141,7 @@ and there higher is better.
   fewer than 12 names fall back to the universe percentile. For financials,
   `s_` equals `u_` by construction on the variant metrics.
 
-### Blocks and pillars (16)
+### Blocks and pillars (20)
 
 | Column | Meaning |
 |---|---|
@@ -157,6 +157,7 @@ and there higher is better.
 | `Q_raw` | `blk_q_engine × shield_dampener`. |
 | `P_raw` | `blk_p_strength × credibility_dampener`. |
 | `V`, `Q`, `B`, `P` | The pillar raw scores re-ranked 0–100 against the universe. |
+| `s_V`, `s_Q`, `s_B`, `s_P` | The same pillar raw scores re-ranked 0–100 within the name's sector. Diagnostic only; never feeds the composite. |
 
 ### Composite (9)
 
@@ -170,12 +171,21 @@ and there higher is better.
 A name needs at least 2 of the 4 pillars to get a composite. Otherwise it is
 blank and flagged THIN.
 
+### Industry group (4)
+
+| Column | Meaning |
+|---|---|
+| `group_raw` | The industry group the taxonomy assigns from sector and industry. |
+| `group` | The group after merges: a group under 12 members is folded into its nearest neighbour. |
+| `grp` | Group strength for the active profile: the median member `rank`, re-ranked 0–100 across groups, rounded. Matches `df.attrs["groups"]`. |
+| `grp_base` | Group strength for the TRADER profile, unrounded. This is what the checklist reads. |
+
 ### Overlays (9)
 
 | Column | Meaning |
 |---|---|
 | `gated` | `1` when a gate applies. |
-| `gates` | Which gates fired: `LEVERAGE` (ND/EBIT > 4×), `NO_EARNINGS` (reported EBIT ≤ 0 with net debt), `BANK_CAPITAL` (equity/assets < 5%), `INSURER_CAPITAL` (< 8%). |
+| `gate_cause` | Why the name is gated, exactly as `ranking.apply_gates` records it (the first rule that fired): `ND/EBIT > 4x`, `EBIT <= 0 with net debt`, `capital below floor` (banks and lenders < 5%, insurers < 8% equity/assets) or `leverage gate (Q4)`. Blank when not gated. |
 | `flags` | Every active flag, most severe first: FX, THIN, STALE, HYGIENE, DISCRETE, CONFLICT, SHORT_HISTORY, LOSS, CALC, NOGP, GPA, PXCHK, WKCHK, FIN. |
 | `pillar_spread` | Highest pillar rank minus lowest. |
 | `safety_score` | `0.6 × shield + 0.4 × drawdown percentile`. |
@@ -183,6 +193,27 @@ blank and flagged THIN.
 | `ad_grade` | A–E by universe quintile of `ad_ratio`. |
 | `green` | `1` = top 5% of the active profile, at least 8 points above the median composite, and not gated. |
 | `triple` | `1` = top decile on all three profiles, and not gated. |
+
+### Checklist (12)
+
+Ten items, each `PASS`, `NEUTRAL` (within 10 points below the bar, or no data)
+or `FAIL`. The checklist is pinned to the TRADER profile whatever `profile` is
+set. Column names come from `config.CHECKLIST`.
+
+| Column | Reads | Bar |
+|---|---|---|
+| `chk::RNK >= 75` | TRADER composite rank | 75 |
+| `chk::GRP >= 60` | `grp_base` | 60 |
+| `chk::Value S-rank >= 60` | `s_V` | 60 |
+| `chk::Engine >= 70` | `blk_q_engine` | 70 |
+| `chk::Net cash or ND/EBIT < 1` | `leverage_ok` | 50 |
+| `chk::B >= 70` | `B` | 70 |
+| `chk::Revisions >= 60` | none - always `NEUTRAL` | 60 |
+| `chk::P >= 70` | `P` | 70 |
+| `chk::Credibility >= 50` | `blk_p_cred` | 50 |
+| `chk::Hygiene >= 40` | `u_hygiene` | 40 |
+| `checklist_passes` | Number of items at `PASS`, 0–10. | |
+| `leverage_ok` | `100` = net cash or ND/EBIT under 1; `0` = ND/EBIT of 1 or more, or a loss with net debt; blank for financials or missing data. | |
 
 ### Context, never ranked (23)
 

@@ -380,7 +380,7 @@ def _previous_state(previous) -> pd.DataFrame | None:
 
 
 # ---------------------------------------------------------------------------
-# the output: 125 columns
+# the output columns (len(COLUMNS))
 # ---------------------------------------------------------------------------
 # model metric key -> output column name
 METRIC_NAMES = {
@@ -406,6 +406,16 @@ METRIC_NAMES = {
     "p6_down_resilience": "down_resilience",
 }
 
+# industry group and its strength: the raw taxonomy group, the group after
+# sub-scale merges, group strength (GRP) for the active profile, and group
+# strength for the base profile (the one the checklist reads)
+GROUP_COLUMNS = ["group_raw", "group", "grp", "grp_base"]
+
+# the ten checklist items, named as config.CHECKLIST labels them, then the pass
+# count and the leverage item's own 100/0 input
+CHECKLIST_COLUMNS = ([f"chk::{label}" for label, _, _ in C.CHECKLIST]
+                     + ["checklist_passes", "leverage_ok"])
+
 COLUMNS = (
     ["symbol", "company", "sector", "industry", "country", "price", "mktcap", "fin_mode"]
     + list(METRIC_NAMES.values())
@@ -413,12 +423,15 @@ COLUMNS = (
     + [f"s_{n}" for n in METRIC_NAMES.values()]
     + ["blk_value", "blk_q_engine", "blk_q_shield", "blk_b_mom", "blk_p_strength", "blk_p_cred",
        "shield_dampener", "credibility_dampener", "V_raw", "Q_raw", "B_raw", "P_raw",
-       "V", "Q", "B", "P",
+       "V", "Q", "B", "P", "s_V", "s_Q", "s_B", "s_P",
        "profile", "composite", "rank"]
     + [f"composite_{p}" for p in C.PROFILES]
     + [f"rank_{p}" for p in C.PROFILES]
-    + ["gated", "gates", "flags", "pillar_spread", "safety_score", "safety_grade", "ad_grade",
-       "green", "triple",
+    + GROUP_COLUMNS
+    + ["gated", "gate_cause", "flags", "pillar_spread", "safety_score", "safety_grade", "ad_grade",
+       "green", "triple"]
+    + CHECKLIST_COLUMNS
+    + [
        "ev", "net_debt", "equity_to_assets", "ntm_coverage", "fwd_basis", "fwd_rev_basis",
        "ntm_blend", "fwd_rev_ntm", "fwd_eps_ntm", "fwd_rev_growth", "fwd_eps_growth", "fwd_pe",
        "ad_ratio", "rev_yoy_ttm", "fwd_earn_yield_calc", "net_debt_to_ebit", "accruals",
@@ -427,27 +440,8 @@ COLUMNS = (
 )
 
 
-def _gates(r) -> str:
-    """Every gate that fired, by the same rules ranking.apply_gates applies."""
-    out = []
-    operating = not bool(r.get("is_fin"))
-    nd_ebit = M._f(r.get("nd_ebit"))
-    if operating and nd_ebit > C.LEVERAGE_GATE_ND_EBIT:
-        out.append("LEVERAGE")
-    if operating and bool(r.get("ebit_negative_with_net_debt")):
-        out.append("NO_EARNINGS")
-    cap = M._f(r.get("capital_ratio"))
-    if r.get("fin_kind") in ("bank", "nbfc") and cap < C.BANK_CAPITAL_GATE:
-        out.append("BANK_CAPITAL")
-    if r.get("fin_kind") == "insurer" and cap < C.INSURER_CAPITAL_GATE:
-        out.append("INSURER_CAPITAL")
-    if not out and bool(r.get("gated")):
-        out.append(str(r.get("gate_cause") or "GATED"))
-    return "|".join(out)
-
-
 def _flags(r) -> str:
-    """Every active flag, most severe first. GATE is reported in gated/gates."""
+    """Every active flag, most severe first. GATE is reported in gated/gate_cause."""
     return "|".join(fl for fl in C.FLAG_SEVERITY
                     if fl != "GATE" and bool(r.get(f"flag_{fl}")))
 
@@ -467,7 +461,7 @@ def _short_history_metrics(r) -> str:
 
 
 def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
-    """Project the full scored frame onto the 125 output columns."""
+    """Project the full scored frame onto the output columns in COLUMNS."""
     nan = pd.Series(np.nan, index=full.index)
     num = lambda c: pd.to_numeric(full[c] if c in full.columns else nan, errors="coerce")
     flag = lambda c: (full[c] if c in full.columns else pd.Series(False, index=full.index)) \
@@ -492,7 +486,8 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
                      ("shield_dampener", "quality_damp"), ("credibility_dampener", "price_damp"),
                      ("V_raw", "value_raw"), ("Q_raw", "quality_raw"), ("B_raw", "biz_raw"),
                      ("P_raw", "price_raw"), ("V", "v_rank_u"), ("Q", "q_rank_u"),
-                     ("B", "b_rank_u"), ("P", "p_rank_u")):
+                     ("B", "b_rank_u"), ("P", "p_rank_u"), ("s_V", "v_rank_s"),
+                     ("s_Q", "q_rank_s"), ("s_B", "b_rank_s"), ("s_P", "p_rank_s")):
         out[col] = num(src)
     out["profile"] = profile
     out["composite"] = num(f"composite_raw_{profile}")
@@ -501,8 +496,14 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
         out[f"composite_{p}"] = num(f"composite_raw_{p}")
     for p in C.PROFILES:
         out[f"rank_{p}"] = num(f"composite_rank_{p}")
+    for c in ("group_raw", "group"):
+        out[c] = full[c] if c in full.columns else None
+    out["grp"] = num("grp")
+    out["grp_base"] = num("grp_base")
     out["gated"] = flag("gated")
-    out["gates"] = [_gates(r) for r in rows]
+    # the cause ranking.apply_gates recorded - the single source for gates
+    out["gate_cause"] = (full["gate_cause"] if "gate_cause" in full.columns
+                         else pd.Series("", index=full.index)).fillna("").astype(str)
     out["flags"] = [_flags(r) for r in rows]
     out["pillar_spread"] = num("flag_pillar_spread")
     out["safety_score"] = num("safety_raw")
@@ -510,6 +511,10 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     out["ad_grade"] = full["ad"]
     out["green"] = flag(f"green_{profile}")
     out["triple"] = flag("triple")
+    for label, _, _ in C.CHECKLIST:
+        out[f"chk::{label}"] = full[f"chk::{label}"] if f"chk::{label}" in full.columns else None
+    out["checklist_passes"] = num("checklist_passes")
+    out["leverage_ok"] = num("leverage_ok")
     out["ev"] = num("ev")
     out["net_debt"] = num("net_debt")
     out["equity_to_assets"] = num("capital_ratio")
@@ -546,7 +551,7 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
 def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
               previous_flags=None, workers: int = 8) -> pd.DataFrame:
     """The whole chain with every intermediate column kept (about 300). The
-    public functions project this onto the 125 output columns."""
+    public functions project this onto the output columns in COLUMNS."""
     if profile not in C.PROFILES:
         raise ValueError(f"profile must be one of {', '.join(C.PROFILES)}")
     if not benchmark:
@@ -583,6 +588,8 @@ def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
 
     df = df.drop(columns=["_price_series"])
     groups = R.group_layer(df, profile)
+    # group strength for the active profile, rounded as FLUX publishes it
+    df = pd.concat([df, df["group"].map(groups["GRP"]).round(0).rename("grp")], axis=1)
 
     # every fact-sheet field the rows do not already carry
     extra = {}
@@ -631,7 +638,7 @@ def run_from_data(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
     data: {ticker: {"blob": statement blob as fmp.fetch_ticker returns it,
                     "ohlcv": daily bars, "mcap_hist": {date: market cap}}}
     benchmark: {date: close} for SPY.
-    Other arguments as run(). Returns the 125-column DataFrame.
+    Other arguments as run(). Returns the DataFrame of COLUMNS.
     """
     full = _run_full(data, benchmark, profile=profile, previous_flags=previous_flags,
                      workers=workers)
@@ -705,7 +712,7 @@ def run(tickers: Iterable[str], api_key: str | None = None, *,
     Returns
     -------
     pandas.DataFrame
-        The 125 columns in COLUMNS, one row per scored name, sorted by `rank`.
+        The columns in COLUMNS, one row per scored name, sorted by `rank`.
         Run-level information (failures, exclusions, group table, market
         vitals, blank shares) is in `df.attrs`.
     """
