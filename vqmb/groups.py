@@ -150,13 +150,15 @@ def resolve_merges(counts: dict, min_size: int = 15) -> dict:
 def assign_group(sector: str | None, industry: str | None) -> str:
     """Exact industry match first; then the sector's default group; then
     UNMAPPED, which is counted and surfaced rather than quietly bucketed."""
-    ind = (industry or "").strip().lower()
+    # a blank field arrives from pandas as NaN (a float, and truthy), so only a
+    # real string is read; anything else is treated as missing
+    ind = industry.strip().lower() if isinstance(industry, str) else ""
     if ind in _LOOKUP:
         return _LOOKUP[ind]
     for key, g in _LOOKUP.items():          # tolerate minor string drift
         if ind and (ind.startswith(key[:14]) or key.startswith(ind[:14])):
             return g
-    sec = (sector or "").strip().lower()
+    sec = sector.strip().lower() if isinstance(sector, str) else ""
     return SECTOR_FALLBACK.get(sec, UNMAPPED)
 
 

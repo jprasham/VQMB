@@ -413,3 +413,24 @@ ZERO_AS_MISSING_FIELDS = ("revenue", "totalAssets")
 # numAnalystsEps on every row. Fewer than MIN_ANALYSTS -> no consensus -> CALC.
 MIN_ANALYSTS = 3
 ANALYST_COUNT_FIELD = "numAnalystsEps"
+
+# Prices quoted in a currency's minor unit. FMP quotes these lines in the minor
+# unit (price 11870 GBp = GBP 118.70) while the market cap is in the major unit,
+# so the price is scaled to the major unit and the statements are converted to
+# the major currency. Keys are matched exactly (case-sensitive): "GBP" is pounds.
+MINOR_UNIT_CURRENCIES = {
+    "GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01),     # London, pence
+    "ZAc": ("ZAR", 0.01), "ZAC": ("ZAR", 0.01),     # Johannesburg, cents
+    "ILA": ("ILS", 0.01),                           # Tel Aviv, agorot
+}
+
+# Per-share figures must be on the same share basis as the traded line. For most
+# ADRs FMP restates EPS per ADR, but not always (HDB: one ADR = three shares).
+# shares_basis = reported diluted shares / (market cap / price). Outside
+# 1 +/- this tolerance the consensus EPS is restated per traded unit
+# (EPS x shares_basis) before the forward yield and forward P/E use it.
+SHARE_BASIS_TOLERANCE = 0.25
+
+# Currency that dollar volume is expressed in, so share classes and
+# cross-listings trading in different currencies compare like with like.
+TURNOVER_CURRENCY = "USD"

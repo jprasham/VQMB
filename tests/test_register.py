@@ -487,3 +487,177 @@ def test_output_is_the_documented_columns():
     held = E.run_from_data(data, bench, previous_flags=prev, workers=4).set_index("symbol")
     band = (full["q6_hygiene_pct"] >= C.HYGIENE_ON) & (full["q6_hygiene_pct"] < C.HYGIENE_OFF)
     assert held.loc[band[band].index, "flags"].str.contains("HYGIENE").all()
+
+
+def test_analyst_count_not_fx_converted(monkeypatch):
+    """Analyst counts on estimate rows are head counts: a cross-currency name
+    must keep them whole while the money fields are converted."""
+    monkeypatch.setattr(FS, "fx_rate", lambda base, quote, key: 1.124)
+    monkeypatch.setattr(FS, "fx_series", lambda base, quote, key: {})
+    blob = {
+        "profile": [{"currency": "USD"}],
+        "income_a": [{"date": _d(100), "reportedCurrency": "EUR", "revenue": 100.0}],
+        "estimates": [{"date": _d(-200), "epsAvg": 10.0, "estimatedEpsAvg": 10.0,
+                       "revenueAvg": 50.0, "numAnalystsEps": 11, "numAnalystsRevenue": 25}],
+    }
+    out = FS.normalise_currency(blob, "ASML", "k")
+    est = out["estimates"][0]
+    assert est["numAnalystsEps"] == 11 and est["numAnalystsRevenue"] == 25
+    assert abs(est["estimatedEpsAvg"] - 11.24) < 1e-9 and abs(est["revenueAvg"] - 56.2) < 1e-9
+    assert out["income_a"][0]["revenue"] == pytest.approx(112.4)
+
+
+def test_blank_sector_or_industry_does_not_stop_the_run():
+    """A blank industry or sector reaches assign_group as NaN (a float). It must
+    land in a group (or UNMAPPED), never raise and stop every other name."""
+    from vqmb.groups import assign_group, UNMAPPED
+    assert assign_group("Technology", NA) == assign_group("Technology", None)
+    assert assign_group(NA, NA) == UNMAPPED
+    assert assign_group(NA, "No Such Industry") == UNMAPPED
+    blobs = _universe()
+    bench = {r["date"]: r["close"] for r in blobs["S00"]["ohlcv"]}
+    data = {t: {"blob": json.loads(json.dumps(b)), "ohlcv": b["ohlcv"], "mcap_hist": {}}
+            for t, b in blobs.items()}
+    prof = data["S07"]["blob"]["profile"]
+    prof = prof[0] if isinstance(prof, list) else prof
+    prof["industry"], prof["sector"] = None, None
+    out = E.run_from_data(data, bench, workers=1)
+    assert len(out) == len(blobs)
+    assert out.set_index("symbol").at["S07", "group_raw"] == UNMAPPED
+
+
+# --------------------------------------------------------------------------
+# probe-confirmed fixes (Oct 2026 FMP probe)
+# --------------------------------------------------------------------------
+def _data():
+    blobs = _universe()
+    bench = {r["date"]: r["close"] for r in blobs["S00"]["ohlcv"]}
+    data = {t: {"blob": json.loads(json.dumps(b)), "ohlcv": json.loads(json.dumps(b["ohlcv"])),
+                "mcap_hist": {}} for t, b in blobs.items()}
+    return data, bench
+
+
+def _with_estimates(blob, eps=(6.0, 7.0), n=10):
+    blob["estimates"] = [{"date": _d(-120), "estimatedEpsAvg": eps[0], "numAnalystsEps": n},
+                         {"date": _d(-485), "estimatedEpsAvg": eps[1], "numAnalystsEps": n}]
+
+
+def _scale_bars(rows, k):
+    for r in rows:
+        for f in ("open", "high", "low", "close", "adjClose"):
+            if r.get(f) is not None:
+                r[f] = r[f] * k
+
+
+def test_minor_unit_price_is_scaled_to_the_major_unit(monkeypatch):
+    """Probe: AZN.L is quoted in GBp (11870) with a GBP market cap, so EPS / price
+    came out 100x too small. A pence line must score exactly like the same
+    company quoted in pounds."""
+    monkeypatch.setattr(FS, "fx_rate", lambda base, quote, key: 1.0 if base == quote else 1.3)
+    monkeypatch.setattr(FS, "fx_series", lambda base, quote, key: {})
+    data, bench = _data()
+    _with_estimates(data["S07"]["blob"])
+    base = E.run_from_data(data, bench, workers=1).set_index("symbol").loc["S07"]
+
+    data, bench = _data()
+    blob = data["S07"]["blob"]
+    _with_estimates(blob)
+    blob["profile"][0]["currency"] = "GBp"
+    for r in blob["income_a"] + blob["income_q"]:
+        r["reportedCurrency"] = "GBP"
+    blob["quote"][0]["price"] *= 100                 # pence; market cap stays in pounds
+    _scale_bars(data["S07"]["ohlcv"], 100)
+    blob = FS.normalise_currency(blob, "S07", "k")
+    assert blob["_fx"]["quote_currency"] == "GBP" and blob["_price_unit_scale"] == 0.01
+    data["S07"]["blob"] = blob
+    out = E.run_from_data(data, bench, workers=1).set_index("symbol").loc["S07"]
+    for c in ("price", "fwd_earn_yield", "fwd_pe", "ebit_to_ev", "dist_from_high", "trend_12_1", "rank"):
+        assert out[c] == pytest.approx(base[c], rel=1e-9, nan_ok=True), c
+    assert "PXCHK" not in out["flags"]
+
+
+def test_minor_unit_statements_convert_to_the_major_currency(monkeypatch):
+    """Probe: /quote USDZAC exists (rand cents), so ZAc statements were
+    converted into cents against a market cap in rand."""
+    seen = []
+    monkeypatch.setattr(FS, "fx_rate", lambda b, q, k: seen.append((b, q)) or 18.0)
+    monkeypatch.setattr(FS, "fx_series", lambda b, q, k: {})
+    blob = {"profile": [{"currency": "ZAc"}],
+            "income_a": [{"date": _d(100), "reportedCurrency": "USD", "revenue": 10.0}]}
+    out = FS.normalise_currency(blob, "NPN.JO", "k")
+    assert ("USD", "ZAR") in seen and ("USD", "ZAC") not in seen
+    assert out["income_a"][0]["revenue"] == pytest.approx(180.0)
+    assert out["_price_unit_scale"] == 0.01
+
+
+def test_duplicate_estimate_dates_do_not_fail_the_name():
+    """Probe: 6758.T failed with "'<' not supported between instances of
+    'dict' and 'dict'" - two estimate rows on one date."""
+    data, bench = _data()
+    blob = data["S07"]["blob"]
+    _with_estimates(blob)
+    dup = dict(blob["estimates"][0], estimatedEpsAvg=6.5)  # same date, different row
+    blob["estimates"] = blob["estimates"] + [dup]
+    out = E.run_from_data(data, bench, workers=1)
+    assert out.attrs["failed"] == []
+    assert out.set_index("symbol").at["S07", "fwd_basis"] == "ntm"
+
+
+def test_share_basis_restates_eps_per_traded_unit():
+    """Probe: HDB market cap / price is 2.99x the reported share count, so EPS
+    per reported share was being divided by a price per ADR."""
+    data, bench = _data()
+    _with_estimates(data["S07"]["blob"])
+    base = E.run_from_data(data, bench, workers=1).set_index("symbol").loc["S07"]
+
+    data, bench = _data()
+    blob = data["S07"]["blob"]
+    _with_estimates(blob)
+    blob["quote"][0]["price"] *= 3                   # one traded unit = three reported shares
+    _scale_bars(data["S07"]["ohlcv"], 3)
+    full = E._run_full(data, bench, workers=1).set_index("symbol").loc["S07"]
+    out = E.to_output(E._run_full(data, bench, workers=1), C.BASE_PROFILE).set_index("symbol").loc["S07"]
+    assert full["share_basis_restated"] and full["share_basis"] == pytest.approx(3.0, rel=1e-6)
+    assert out["fwd_earn_yield"] == pytest.approx(base["fwd_earn_yield"], rel=1e-9)
+    assert out["fwd_eps_ntm"] == pytest.approx(3 * base["fwd_eps_ntm"], rel=1e-9)
+    assert not full["workings_mismatch"]
+
+
+def test_fold_compares_turnover_in_one_currency():
+    """Probe: TSM/2330.TW folded to 2330.TW because TWD turnover was compared
+    with USD turnover. The comparison is in config.TURNOVER_CURRENCY."""
+    data, bench = _data()
+    data["S07"]["blob"]["profile"][0]["currency"] = "USD"
+    twin = json.loads(json.dumps(data["S07"]))
+    twin["blob"]["profile"][0]["currency"] = "TWD"
+    twin["blob"]["_turnover_rate"] = 0.0314           # USD per TWD
+    for r in twin["ohlcv"]:
+        r["volume"] *= 10                             # 10x the local turnover, 0.3x in USD
+    data["S07L"] = twin
+    out = E.run_from_data(data, bench, workers=1)
+    kept = [x["kept"] for x in out.attrs["folded_share_classes"]]
+    assert kept == ["S07"]
+
+
+def test_client_errors_are_not_retried(monkeypatch):
+    """Probe: every /forex-quote call was a 404; the library slept through
+    four retries on each before moving on."""
+    calls, sleeps = [], []
+
+    class R:
+        status_code = 404
+        text = "not found"
+
+    monkeypatch.setattr(FS.requests, "get", lambda *a, **k: calls.append(1) or R())
+    monkeypatch.setattr(FS.time, "sleep", lambda s: sleeps.append(s))
+    with pytest.raises(FS.PermanentHTTPError):
+        FS._get(FS.STABLE_BASE + "/quote", {"symbol": "X"}, "k")
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_fx_cache_is_reset_per_fetch(monkeypatch):
+    FS._FX_CACHE[("ILS", "USD")] = None              # a miss from an earlier run
+    monkeypatch.setattr(FS, "fetch_ticker", lambda *a, **k: {})
+    monkeypatch.setattr(FS, "fetch_extra", lambda *a, **k: {"ohlcv": [], "mcap_hist": {}})
+    E.fetch_data(["X"], api_key="k", workers=1)
+    assert ("ILS", "USD") not in FS._FX_CACHE

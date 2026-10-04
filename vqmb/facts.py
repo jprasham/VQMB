@@ -311,6 +311,9 @@ def drawdown_episodes(closes: list[float]) -> tuple[int, float]:
     return n, worst
 
 
+_PRICE_FIELDS = ("open", "high", "low", "close", "adjClose", "vwap", "price")
+
+
 def _bar_close(r: dict) -> float:
     """Row 27: adjusted close if present and positive, else close if positive,
     else missing. A null adjClose must fall back to close, and a zero close is
@@ -640,17 +643,24 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
     f["shares_3y"] = _get(inc_a, 3, "weightedAverageShsOutDil")
 
     # ---- forward estimates ----
-    dated = []
+    # one row per fiscal-year date, sorted by date only: two rows on the same
+    # date would otherwise be compared as dicts and fail the whole name
+    dated, seen_dates = [], set()
     for e in _rows(blob, "estimates"):
         try:
-            dated.append((dt.date.fromisoformat(str(e.get("date"))[:10]), e))
+            d_est = dt.date.fromisoformat(str(e.get("date"))[:10])
         except (TypeError, ValueError):
             continue
+        if d_est in seen_dates:
+            continue
+        seen_dates.add(d_est)
+        dated.append((d_est, e))
+    dated.sort(key=lambda x: x[0])
     f["w_ntm_parts"] = []
     eps, cov, desc = ntm_blend(dated, "estimatedEpsAvg", parts_out=f["w_ntm_parts"])
     # row 23: the fallback may only use a fiscal year that has not yet ended
     cutoff = TODAY + dt.timedelta(days=C.NTM_FALLBACK_MIN_DAYS_AHEAD)
-    future = [(d, e) for d, e in sorted(dated) if d > cutoff]
+    future = [(d, e) for d, e in dated if d > cutoff]
     if _ok(eps) and cov >= 0.80:
         f["ntm_eps"], f["fwd_basis"] = eps, "ntm"
         used = [e for d, e in dated if d.isoformat() in {p[0] for p in f["w_ntm_parts"]}]
@@ -673,7 +683,7 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
     if _ok(rev_ntm) and rev_cov >= 0.80:
         f["fwd_rev"], f["fwd_rev_basis"] = rev_ntm, "ntm"
     else:
-        future_r = [(d, e) for d, e in sorted(dated) if d > cutoff]
+        future_r = [(d, e) for d, e in dated if d > cutoff]
         f["fwd_rev"] = _f(future_r[0][1].get("estimatedRevenueAvg")) if future_r else NA
         f["fwd_rev_basis"] = "fy_fallback" if future_r else "none"
 
@@ -800,7 +810,40 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
     f["pb_median_hist" if is_fin else "ev_sales_median_hist"] = med
 
     # ---- price-derived ----
-    f.update(build_price_facts(_rows(blob, "ohlcv"), bench_closes, _f(quote.get("price"))))
+    # a minor-unit line (GBp, ZAc, ILA) is scaled to the major unit, the unit
+    # its market cap and converted statements are in; returns are unchanged
+    scale = _f(blob.get("_price_unit_scale"))
+    scale = scale if _ok(scale) and scale > 0 else 1.0
+    f["price_unit_scale"] = scale
+    bars = _rows(blob, "ohlcv")
+    if scale != 1.0:
+        bars = [{k: (v * scale if k in _PRICE_FIELDS and _ok(_f(v)) else v) for k, v in r.items()}
+                if isinstance(r, dict) else r for r in bars]
+    f.update(build_price_facts(bars, bench_closes, _f(quote.get("price")) * scale))
+
+    # turnover in one currency (config.TURNOVER_CURRENCY), so share classes and
+    # cross-listings in different currencies are compared like with like
+    rate = _f(blob.get("_turnover_rate"))
+    if not _ok(rate) and str(f.get("currency") or "").upper() == C.TURNOVER_CURRENCY:
+        rate = 1.0
+    dv = _f(f.get("dollar_volume"))
+    f["dollar_volume"] = dv * rate if _ok(dv, rate) else NA
+
+    # per-share consensus on the traded line's share basis (an ADR may carry
+    # several ordinary shares): restate EPS per traded unit when the reported
+    # share count and market cap / price disagree beyond the tolerance
+    units = _safe(f.get("mcap"), f.get("price"))
+    basis = _safe(f.get("shares_now"), units) if _ok(_f(units)) and units > 0 else NA
+    f["share_basis"] = basis
+    tol = C.SHARE_BASIS_TOLERANCE
+    if _ok(_f(basis)) and basis > 0 and not (1 / (1 + tol) <= basis <= 1 + tol):
+        if _ok(_f(f.get("ntm_eps"))):
+            f["ntm_eps"] = f["ntm_eps"] * basis
+            # the workings re-add the blend, so its parts move to the same basis
+            f["w_ntm_parts"] = [(d, v * basis, wt) for d, v, wt in f.get("w_ntm_parts") or []]
+        f["share_basis_restated"] = True
+    else:
+        f["share_basis_restated"] = False
     return f
 
 

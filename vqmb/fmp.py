@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from . import config as C
+
 log = logging.getLogger("vqmb")
 
 STABLE_BASE = "https://financialmodelingprep.com/stable"
@@ -45,7 +47,9 @@ STABLE_ENDPOINTS = {
     "income_q":    ("/income-statement",         {"symbol": "{t}", "period": "quarter", "limit": 12}),
     "balance_a":   ("/balance-sheet-statement",  {"symbol": "{t}", "period": "annual", "limit": 6}),
     "cashflow_q":  ("/cash-flow-statement",      {"symbol": "{t}", "period": "quarter", "limit": 8}),
-    "estimates":   ("/analyst-estimates",        {"symbol": "{t}", "period": "annual", "limit": 6}),
+    # FMP returns estimates furthest year first; 10 rows keep the next two
+    # fiscal years even for names with long-dated coverage
+    "estimates":   ("/analyst-estimates",        {"symbol": "{t}", "period": "annual", "limit": 10}),
 }
 
 INDEX_PATHS = {
@@ -152,6 +156,10 @@ def _alias(payload, kind: str):
 # ---------------------------------------------------------------------------
 # HTTP with retry/backoff
 # ---------------------------------------------------------------------------
+class PermanentHTTPError(RuntimeError):
+    """A 4xx response other than 429: retrying cannot help."""
+
+
 def _get(url: str, params: dict, api_key: str):
     p = dict(params)
     p["apikey"] = api_key
@@ -163,8 +171,14 @@ def _get(url: str, params: dict, api_key: str):
                 time.sleep(RETRY_BASE_SLEEP * (2 ** attempt))
                 last = RuntimeError("429 rate limited")
                 continue
+            if 400 <= r.status_code < 500:
+                # a client error (404 unknown endpoint, 401/403 plan) will not
+                # change on retry - fail at once instead of sleeping through retries
+                raise PermanentHTTPError(f"HTTP {r.status_code} for {url}")
             r.raise_for_status()
             return r.json()
+        except PermanentHTTPError:
+            raise
         except Exception as e:      # network blip, 5xx, bad JSON
             last = e
             if attempt == MAX_RETRIES - 1:
@@ -198,7 +212,8 @@ def _fill(params: dict, ticker: str) -> dict:
 #
 # Blobs carry a schema marker so cached copies written under a different layout
 # are refetched rather than silently reused.
-CACHE_SCHEMA = 2
+# 3: analyst counts no longer FX-converted - older cached blobs carry converted counts
+CACHE_SCHEMA = 3
 
 # Keys inside a statement row that are NOT amounts of money and must never be
 # scaled: share counts, years, identifiers, and anything already a ratio.
@@ -208,6 +223,8 @@ _NON_MONETARY_EXACT = {
     "weightedAverageShsOut", "weightedAverageShsOutDil",
     "weightedAverageShsOutstanding", "weightedAverageShsOutstandingDil",
     "sharesOutstanding", "commonStockSharesOutstanding", "numberOfShares",
+    # analyst counts on the estimate rows are head counts, not money
+    "numAnalystsEps", "numAnalystsRevenue",
 }
 # Substrings are matched against the whole key, so they must not appear inside a
 # genuine money field. "count" is deliberately absent: it matches accountPayables.
@@ -224,6 +241,14 @@ def _is_monetary(key: str) -> bool:
 
 _FX_CACHE = {}
 _FX_SERIES_CACHE = {}
+
+
+def reset_fx_cache():
+    """Forget cached FX rates. Called at the start of every fetch, so a failed
+    lookup or yesterday's rate does not carry into a later run in the same
+    Python process (a notebook or a long-running service)."""
+    _FX_CACHE.clear()
+    _FX_SERIES_CACHE.clear()
 
 
 def fx_series(base: str, quote: str, api_key: str):
@@ -325,9 +350,9 @@ def fx_rate(base: str, quote: str, api_key: str):
         return None
 
     rate = None
-    for path, sym, invert in (("/forex-quote", f"{base}{quote}", False),
-                              ("/quote", f"{base}{quote}", False),
-                              ("/forex-quote", f"{quote}{base}", True),
+    # /forex-quote is not a /stable/ endpoint (404 for every pair in the probe);
+    # /quote answers both directions
+    for path, sym, invert in (("/quote", f"{base}{quote}", False),
                               ("/quote", f"{quote}{base}", True)):
         try:
             v = _read(_get(STABLE_BASE + path, {"symbol": sym}, api_key))
@@ -392,10 +417,21 @@ def normalise_currency(blob: dict, ticker: str, api_key: str) -> dict:
             break
     prof = blob.get("profile")
     prof = prof[0] if isinstance(prof, list) and prof else (prof if isinstance(prof, dict) else {})
-    quoted = str((prof or {}).get("currency") or "").upper() or None
+    raw_quoted = str((prof or {}).get("currency") or "").strip() or None
+    # a minor-unit quote (GBp, ZAc, ILA): compare and convert against the major
+    # currency, and tell the fact sheet to scale prices to the major unit
+    major, scale = C.MINOR_UNIT_CURRENCIES.get(raw_quoted, (None, 1.0))
+    quoted = major or (raw_quoted.upper() if raw_quoted else None)
+    blob["_price_unit_scale"] = scale
 
     info = {"reported_currency": reported, "quote_currency": quoted,
+            "quote_unit": raw_quoted, "price_unit_scale": scale,
             "rate": 1.0, "applied": False, "status": "same currency"}
+
+    # turnover in one currency, so lines in different currencies compare
+    if quoted:
+        usd = fx_rate(quoted, C.TURNOVER_CURRENCY, api_key)
+        blob["_turnover_rate"] = usd if usd else None
 
     if not reported or not quoted:
         info["status"] = "unknown — currency field missing"

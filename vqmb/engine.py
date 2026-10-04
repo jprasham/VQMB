@@ -659,6 +659,7 @@ def fetch_data(tickers: Iterable[str], api_key: str | None = None, workers: int 
     than once, or saved."""
     api_key = _key(api_key)
     tickers = _clean_tickers(tickers)
+    fmp.reset_fx_cache()          # fresh FX for every fetch, never a stale miss
 
     def one(t):
         try:
