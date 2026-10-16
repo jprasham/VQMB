@@ -431,6 +431,49 @@ def ntm_blend(dated, field, today=None, horizon=365, parts_out=None):
     return value, min(1.0, total_w), desc
 
 
+def v4_revenue(dated, cutoff, rev_ttm, g) -> dict:
+    """The revenue V4 applies its mid-cycle margin to (flux-2.1).
+
+    Consensus, exactly as for NTM EPS: fiscal-year revenue blended by how much
+    of each year falls in the next 365 days (>= 80% coverage), else the
+    nearest fiscal year not yet ended; fewer than MIN_ANALYSTS revenue
+    analysts behind it -> no consensus. Basis guard: consensus below
+    NTM_REV_BASIS_FLOOR x TTM revenue is on a different basis (net vs gross
+    revenue at brokers and exchanges, a spin-off already excluded) and is not
+    used. No usable consensus -> model-built TTM revenue x (1 + g), the same
+    projection the EPS side uses; missing growth stays missing."""
+    out = {"v4_rev": NA, "v4_rev_basis": "none", "v4_rev_consensus": NA,
+           "v4_rev_analysts": NA, "v4_rev_guard": False, "w_v4_rev_parts": []}
+    parts = []
+    rev, cov, _ = ntm_blend(dated, "estimatedRevenueAvg", parts_out=parts)
+    future = [(d, e) for d, e in dated if d > cutoff]
+    if _ok(rev) and cov >= 0.80:
+        cons, basis = rev, "ntm"
+        used = [e for d, e in dated if d.isoformat() in {p[0] for p in parts}]
+        out["w_v4_rev_parts"] = parts
+    else:
+        cons = _f(future[0][1].get("estimatedRevenueAvg")) if future else NA
+        basis = "fy_fallback" if future else "none"
+        used = [future[0][1]] if future else []
+    if C.REV_ANALYST_COUNT_FIELD and used:
+        counts = [_f(e.get(C.REV_ANALYST_COUNT_FIELD)) for e in used]
+        n = min(c for c in counts if _ok(c)) if any(_ok(c) for c in counts) else NA
+        out["v4_rev_analysts"] = n
+        if not _ok(n) or n < C.MIN_ANALYSTS:
+            cons = NA
+    out["v4_rev_consensus"] = cons
+    if (_ok(cons) and C.NTM_REV_BASIS_FLOOR is not None and _ok(_f(rev_ttm))
+            and rev_ttm > 0 and cons < C.NTM_REV_BASIS_FLOOR * rev_ttm):
+        out["v4_rev_guard"] = True
+        cons = NA
+    if _ok(cons) and cons > 0:
+        out["v4_rev"], out["v4_rev_basis"] = cons, basis
+    elif _ok(_f(rev_ttm), _f(g)):
+        out["v4_rev"] = rev_ttm * (1.0 + g)
+        out["v4_rev_basis"] = "calc_guard" if out["v4_rev_guard"] else "calc"
+    return out
+
+
 def projection_growth(rev_yoy_ttm, persistence, sector):
     """g for the CALC path: delivered TTM revenue growth, floored at 0%, capped
     at 20% except for structurally fast sectors or proven repeat growers."""
@@ -784,6 +827,9 @@ def build_facts(symbol: str, blob: dict, bench_closes: dict, mcap_hist: dict) ->
     f["g_projection"] = projection_growth(f["rev_yoy_ttm"],
                                           f["persistence_hits"] / f["persistence_quarters"]
                                           if f["persistence_quarters"] else NA, sector)
+
+    # ---- V4 revenue: next twelve months, built with the NTM EPS rules ----
+    f.update(v4_revenue(dated, cutoff, f["rev_ttm"], f["g_projection"]))
 
     # ---- own-history medians (V5) ----
     ratios = []

@@ -49,6 +49,11 @@ PROFILES = {
 }
 BASE_PROFILE = "TRADER"
 
+# The FLUX model spec this library implements. Written into df.attrs so every
+# output says which model produced it. (VQMB keeps its documented departures
+# from FLUX on top of this spec - see METRIC_NEUTRAL_FILL_ON.)
+SPEC_VERSION = "flux-2.1-us"
+
 # --------------------------------------------------------------------------
 # Pillar structure. Each metric is (key, direction) where direction is
 # +1 "higher raw ranks higher" or -1 "lower raw ranks higher" (the inv marker).
@@ -56,19 +61,31 @@ BASE_PROFILE = "TRADER"
 # --------------------------------------------------------------------------
 VALUE_METRICS = [
     ("v1_ebit_ev", +1),
-    ("v2_ev_gp", -1),          # FIN variant flips to book/price, direction +1
+    ("v2_gp_ev", +1),          # gross profit / EV; FIN variant book/price - both higher = cheaper
     ("v3_fwd_earn_yield", +1),
     ("v4_norm_ep", +1),
     ("v5_ev_sales_vs_hist", -1),
 ]
 QUALITY_ENGINE = [("q1_roic", +1), ("q2_roiic", +1), ("q3_persistence", +1)]
 QUALITY_SHIELD = [("q4_leverage_score", +1), ("q5_drawdown", -1), ("q6_hygiene", -1)]
+# flux-2.1: Quality is ONE block, the equal-weight mean of all six percentiles.
+# The engine / shield lists remain only to name the protection score behind the
+# Safety grade (leverage, drawdown, hygiene).
+QUALITY_METRICS = QUALITY_ENGINE + QUALITY_SHIELD
+
+# Metrics that do not exist for financials (banks, NBFCs, insurers). They are
+# not computed, not scored and not shown for those names, and are LEFT OUT of
+# the block mean - never given the neutral fill, which is for data that should
+# exist but is missing. Rollback: FIN_NOT_APPLICABLE = ()
+FIN_NOT_APPLICABLE = ("q6_hygiene",)
 BIZ_METRICS = [("b1_vs_trend", +1), ("b2_sequential", +1), ("b3_margin_delta", +1)]
 PRICE_STRENGTH = [("p1_trend_12_1", +1), ("p2_trend_6_1", +1), ("p3_high_distance", +1)]
 PRICE_CREDIBILITY = [("p4_continuity", +1), ("p5_lottery", -1), ("p6_down_resilience", +1)]
 
-# metrics whose direction flips under the financials variant
-FIN_DIRECTION_OVERRIDE = {"v2_ev_gp": +1}      # becomes book/price
+# metrics whose direction flips under the financials variant. Empty since
+# flux-2.1: V2 is gross profit / EV, so its financials variant (book / price)
+# already reads the same way - higher is cheaper.
+FIN_DIRECTION_OVERRIDE = {}
 
 # Metrics whose FORMULA differs for financials (§12). These are ranked within
 # the FIN group only and the resulting percentile is spliced into the U column,
@@ -80,14 +97,13 @@ FIN_DIRECTION_OVERRIDE = {"v2_ev_gp": +1}      # becomes book/price
 # of P1-P6 - and so ranks universe-wide as normal.
 VARIANT_METRICS = {
     "v1_ebit_ev",          # EBIT/EV        -> E/P
-    "v2_ev_gp",            # EV/GP          -> book/price
+    "v2_gp_ev",            # GP/EV          -> book/price
     "v4_norm_ep",          # normalized E/P -> 5y avg ROE x book / mcap
     "v5_ev_sales_vs_hist", # EV/S vs own    -> P/B vs own
     "q1_roic",             # ROIC           -> ROE
     "q2_roiic",            # ROIIC          -> incremental ROE
     "q3_persistence",      # on revenue     -> on PPOP / GWP
     "q4_leverage_score",   # ND/EBIT curve  -> equity/assets curve
-    "q6_hygiene",          # accruals dropped, bloat redefined
     "b1_vs_trend",         # volume line    -> PPOP / GWP
     "b2_sequential",
     "b3_margin_delta",     # gross margin   -> NIM / combined ratio
@@ -98,11 +114,10 @@ ALL_METRICS = (VALUE_METRICS + QUALITY_ENGINE + QUALITY_SHIELD + BIZ_METRICS
 METRIC_COUNT = len(ALL_METRICS)                # 20
 
 # --------------------------------------------------------------------------
-# Dampeners (§6, §8) — multiply inside a pillar, before re-ranking.
-# Both can only ever COST score, never add: floor + span * (x/100) where
-# floor + span = 1.0 at x = 100.
+# Dampener (§8) — multiplies inside the price pillar, before re-ranking. It
+# can only ever COST score: floor + span * (x/100), = 1.0 at x = 100.
+# flux-2.1: the quality shield dampener is gone; this is the only dampener.
 # --------------------------------------------------------------------------
-SHIELD_FLOOR, SHIELD_SPAN = 0.6, 0.4        # quality:  0.6 + 0.4 * shield/100
 CRED_FLOOR, CRED_SPAN = 0.5, 0.5            # price:    0.5 + 0.5 * cred/100
 
 # --------------------------------------------------------------------------
@@ -204,7 +219,7 @@ CHECKLIST = [
     ("RNK >= 75", f"composite_rank_{BASE_PROFILE}", 75.0),
     ("GRP >= 60", "grp_base", 60.0),
     ("Value S-rank >= 60", "v_rank_s", 60.0),
-    ("Engine >= 70", "quality_engine", 70.0),
+    ("Quality rank >= 70", "q_rank_u", 70.0),
     # leverage_ok is 100 (pass) or 0 (fail), so a bar of 50 can actually fail (row 5)
     ("Net cash or ND/EBIT < 1", "leverage_ok", 50.0),
     ("B >= 70", "b_rank_u", 70.0),
@@ -346,7 +361,7 @@ ROIC_LOSS_MODE = "negative"
 # False: blank, no gate. A REPORTED EBIT <= 0 with net debt still gates.
 MISSING_EBIT_GATES = False
 
-# row 10 - one neutral value for a blank shield or credibility, used both in the
+# row 10 - one neutral value for a blank protection score or credibility, used both in the
 # pillar dampener and in the Safety grade, instead of best case in one place
 # and worst case in the other
 DAMPENER_NEUTRAL_FILL = 50.0
@@ -354,7 +369,7 @@ DAMPENER_NEUTRAL_FILL = 50.0
 # A metric that is blank (missing or not computable) inside a pillar counts as
 # a neutral percentile of 50 in its sub-block mean, instead of dropping out and
 # re-averaging the rest. Applies to every sub-block of all four pillars (V,
-# Q engine, Q shield, B, P strength, P credibility). The metric's own u_/s_
+# Q, B, P strength, P credibility). The metric's own u_/s_
 # percentile stays blank, so what was filled is still visible.
 # Deliberate departure from FLUX, which drops the blank. False restores FLUX.
 METRIC_NEUTRAL_FILL_ON = True
@@ -392,6 +407,15 @@ NTM_FALLBACK_MIN_DAYS_AHEAD = 0
 
 # rows 19-20 - every five-year average needs at least this many years
 MIN_AVG_YEARS = 3
+
+# V4 (normalized E/P) on next-twelve-months revenue, built with the NTM EPS
+# rules: fiscal-year blend at >= 80% coverage, else the nearest unclosed fiscal
+# year; at least MIN_ANALYSTS revenue analysts; no consensus -> TTM revenue x
+# (1 + g). Basis guard: consensus below this share of TTM revenue is on a
+# different basis (net vs gross revenue, a spin-off already excluded) and the
+# model-built figure is used instead. Rollback: NTM_REV_BASIS_FLOOR = None
+NTM_REV_BASIS_FLOOR = 0.75
+REV_ANALYST_COUNT_FIELD = "numAnalystsRevenue"
 
 # row 37 - daily moves beyond this are reported for review, never dropped
 IMPLAUSIBLE_DAILY_MOVE = 0.40          # 40%, not the register's 50%: a real 2-for-1 split day

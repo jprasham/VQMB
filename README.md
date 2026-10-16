@@ -1,12 +1,13 @@
 # VQMB
 
-A quantitative stock-ranking model packaged as a Python library. It has four
-sub-models:
+A quantitative stock-ranking model packaged as a Python library. It implements
+FLUX spec **flux-2.1-us** (written to `df.attrs["spec_version"]`), plus the
+VQMB-only departures documented below. It has four sub-models:
 
 | Pillar | Letter | What it measures |
 |---|---|---|
 | Value | **V** | Five valuation lenses; a name must look cheap several ways at once |
-| Quality | **Q** | Returns on capital and growth persistence (the engine), discounted by a balance-sheet and drawdown shield |
+| Quality | **Q** | Six equal-weight metrics: returns on capital, growth persistence, leverage, drawdown history and accounting hygiene (five for financials, which have no hygiene) |
 | Business momentum | **B** | Acceleration in the business: revenue vs trend, sequential change, margin direction |
 | Price momentum | **M** | Volatility-adjusted trend strength, discounted by a credibility dampener |
 
@@ -122,39 +123,50 @@ networks stay on the standard set.
 
 | Block | Columns |
 |---|---|
-| Value | `ebit_to_ev`, `ev_to_gp`↓, `fwd_earn_yield`, `normalized_ep`, `ev_sales_vs_hist`↓ |
-| Quality – engine | `roic`, `roiic`, `growth_persistence` |
-| Quality – shield | `leverage_score`, `drawdown_history`↓, `hygiene` |
+| Value | `ebit_to_ev`, `gp_to_ev`, `fwd_earn_yield`, `normalized_ep`, `ev_sales_vs_hist`↓ |
+| Quality | `roic`, `roiic`, `growth_persistence`, `leverage_score`, `drawdown_history`↓, `hygiene` |
 | Business momentum | `latest_q_vs_3y`, `seq_accel`, `gm_change_yoy` |
 | Price – strength | `trend_12_1`, `trend_6_1`, `dist_from_high` |
 | Price – credibility | `continuity`, `lottery_days`↓, `down_resilience` |
 
-↓ = lower is better. For `ev_to_gp`, the financials variant is book/price,
-and there higher is better.
+↓ = lower is better.
+
+- `gp_to_ev` = TTM gross profit ÷ EV, a gross-profit yield (was EV ÷ gross
+  profit before flux-2.1; every percentile is unchanged). Financials use book ÷
+  price (tangible book for insurers), also higher = cheaper.
+- `normalized_ep` = 5-year average net margin × **NTM revenue** ÷ market cap.
+  NTM revenue is built like NTM EPS: fiscal years blended over the next 365
+  days (≥ 80% coverage, else the nearest unclosed year), at least 3 revenue
+  analysts, else model-built TTM revenue × (1 + g). Consensus below 75% of TTM
+  revenue (`NTM_REV_BASIS_FLOOR`) is treated as a different basis and the
+  model-built figure is used. Financials: 5-year average ROE × book ÷ market cap.
+- `trend_12_1`, `trend_6_1` = the compounded window return (months −12 to −2,
+  −6 to −2) ÷ the standard deviation of those monthly returns.
+- `hygiene` is not applicable to financials: not computed, not scored, not in
+  the checklist, and not neutral-filled (`FIN_NOT_APPLICABLE`).
 
 ### Percentiles (40)
 
 - `u_<metric>`: the universe percentile, 0–100, where 100 is always best.
-  This is what feeds the score. For the 12 variant metrics, financials are
+  This is what feeds the score. For the 11 variant metrics, financials are
   ranked only against other financials.
 - `s_<metric>`: the sector percentile. It is diagnostic only. Sectors with
   fewer than 12 names fall back to the universe percentile. For financials,
   `s_` equals `u_` by construction on the variant metrics.
 
-### Blocks and pillars (20)
+### Blocks and pillars (19)
 
 | Column | Meaning |
 |---|---|
 | `blk_value` | Mean of the V1–V5 percentiles. In every `blk_` column a blank metric counts as 50. |
-| `blk_q_engine` | Mean of the Q1–Q3 percentiles. |
-| `blk_q_shield` | Mean of the Q4–Q6 percentiles. |
+| `blk_quality` | Mean of the Q1–Q6 percentiles (Q1–Q5 for financials). |
+| `protection` | Mean of the leverage, drawdown and hygiene percentiles (leverage and drawdown for financials). Feeds the Safety grade only. |
 | `blk_b_mom` | Mean of the B1–B3 percentiles. |
 | `blk_p_strength` | Mean of the P1–P3 percentiles. |
 | `blk_p_cred` | Mean of the P4–P6 percentiles. |
-| `shield_dampener` | `0.6 + 0.4 × shield/100`. A blank shield counts as 50. |
 | `credibility_dampener` | `0.5 + 0.5 × credibility/100`. A blank credibility counts as 50. |
 | `V_raw`, `B_raw` | Equal to `blk_value` and `blk_b_mom`. |
-| `Q_raw` | `blk_q_engine × shield_dampener`. |
+| `Q_raw` | Equal to `blk_quality` - no dampener since flux-2.1. |
 | `P_raw` | `blk_p_strength × credibility_dampener`. |
 | `V`, `Q`, `B`, `P` | The pillar raw scores re-ranked 0–100 against the universe. |
 | `s_V`, `s_Q`, `s_B`, `s_P` | The same pillar raw scores re-ranked 0–100 within the name's sector. Diagnostic only; never feeds the composite. |
@@ -189,16 +201,16 @@ sub-block with every metric blank scores 50), so THIN does not fire.
 | `gate_cause` | Why the name is gated, exactly as `ranking.apply_gates` records it (the first rule that fired): `ND/EBIT > 4x`, `EBIT <= 0 with net debt`, `capital below floor` (banks and lenders < 5%, insurers < 8% equity/assets) or `leverage gate (Q4)`. Blank when not gated. |
 | `flags` | Every active flag, most severe first: FX, THIN, STALE, HYGIENE, DISCRETE, CONFLICT, SHORT_HISTORY, LOSS, CALC, NOGP, GPA, PXCHK, WKCHK, FIN. |
 | `pillar_spread` | Highest pillar rank minus lowest. |
-| `safety_score` | `0.6 × shield + 0.4 × drawdown percentile`. |
+| `safety_score` | `0.6 × protection + 0.4 × drawdown percentile`. |
 | `safety_grade` | A–E on absolute bands (85 / 70 / 50 / 30). Any gate forces E. |
 | `ad_grade` | A–E by universe quintile of `ad_ratio`. |
 | `green` | `1` = top 5% of the active profile, at least 8 points above the median composite, and not gated. |
 | `triple` | `1` = top decile on all three profiles, and not gated. |
 
-### Checklist (12)
+### Checklist (13)
 
 Ten items, each `PASS`, `NEUTRAL` (within 10 points below the bar, or no data)
-or `FAIL`. The checklist is pinned to the TRADER profile whatever `profile` is
+or `FAIL`. For financials the hygiene item is `N/A`, so they are scored out of 9. The checklist is pinned to the TRADER profile whatever `profile` is
 set. Column names come from `config.CHECKLIST`.
 
 | Column | Reads | Bar |
@@ -206,14 +218,15 @@ set. Column names come from `config.CHECKLIST`.
 | `chk::RNK >= 75` | TRADER composite rank | 75 |
 | `chk::GRP >= 60` | `grp_base` | 60 |
 | `chk::Value S-rank >= 60` | `s_V` | 60 |
-| `chk::Engine >= 70` | `blk_q_engine` | 70 |
+| `chk::Quality rank >= 70` | `Q` | 70 |
 | `chk::Net cash or ND/EBIT < 1` | `leverage_ok` | 50 |
 | `chk::B >= 70` | `B` | 70 |
 | `chk::Revisions >= 60` | none - always `NEUTRAL` | 60 |
 | `chk::P >= 70` | `P` | 70 |
 | `chk::Credibility >= 50` | `blk_p_cred` | 50 |
-| `chk::Hygiene >= 40` | `u_hygiene` | 40 |
-| `checklist_passes` | Number of items at `PASS`, 0–10. | |
+| `chk::Hygiene >= 40` | `u_hygiene` (`N/A` for financials) | 40 |
+| `checklist_passes` | Number of items at `PASS`. | |
+| `checklist_items` | Items that apply: 10, or 9 for financials. | |
 | `leverage_ok` | `100` = net cash or ND/EBIT under 1; `0` = ND/EBIT of 1 or more, or a loss with net debt; blank for financials or missing data. | |
 
 ### Context, never ranked (24)
@@ -275,9 +288,12 @@ sub-block is the equal-weight mean of all its metrics. Example: B1 blank, B2 at
 moves across sub-blocks. This differs from FLUX, which drops a blank and
 averages the rest; `config.METRIC_NEUTRAL_FILL_ON = False` restores the FLUX
 rule.
-Quality = engine × (0.6 + 0.4 × shield/100). Price = strength × (0.5 + 0.5 ×
-credibility/100). Both dampeners can only reduce a score, and a blank shield
-or blank credibility counts as a neutral 50.
+A metric that does not apply (hygiene on a financial) is left out of the
+mean, not filled with 50.
+Quality = the mean of its six percentiles (five for financials). Price =
+strength × (0.5 + 0.5 × credibility/100); this dampener can only reduce a
+score, a blank credibility counts as a neutral 50, and it is the model's only
+dampener.
 
 **Profiles.** These are the pillar weights, in %:
 
@@ -324,8 +340,10 @@ pytest
 
 The tests include:
 
-- the reference worked example: engine 75 / shield 78 → quality 68.4, and
-  composites of 70 / 74.625 / 75.7
+- the reference worked example: quality as the mean of six, price dampener at
+  credibility 70, and composites of 70 / 74.625 / 75.7
+- one check per flux-2.1 change (V2, V4 on NTM revenue and its basis guard,
+  Quality as one block, hygiene N/A for financials, compounded P1/P2)
 - one check per data-quality rule
 - a full synthetic-universe run through the engine
 

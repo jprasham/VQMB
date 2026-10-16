@@ -36,14 +36,14 @@ def check_blank(label, got):
 
 # ---------------------------------------------------------------------------
 def test_aura_walkthrough():
-    """Handbook §3. Value raw 60 -> V=71; engine 75 x shield damp (shield 78)
-    -> 68 -> Q=74; biz raw 81 -> B=89; strength 58 x cred damp (cred 70) -> 49
-    -> P=58. Then the three profile composites."""
+    """Handbook §3, flux-2.1. Value raw 60 -> V=71; quality = plain mean of
+    six percentiles -> Q=74; biz raw 81 -> B=89; strength 58 x cred damp
+    (cred 70) -> 49 -> P=58. Then the three profile composites."""
 
-    shield_damp = C.SHIELD_FLOOR + C.SHIELD_SPAN * 78 / 100.0
-    quality_raw = 75 * shield_damp
-    check("shield dampener at shield=78", shield_damp, 0.912, 1e-9)
-    check("quality raw = engine 75 x dampener", quality_raw, 68.4, 0.05)
+    six = pd.DataFrame({k: [v] for (k, _), v in zip(C.QUALITY_METRICS, (75, 75, 75, 78, 78, 78))})
+    q = R.build_pillars(pd.DataFrame(index=[0]), six)
+    check("quality raw = mean of six (engine 75s, shield 78s)",
+          float(q["quality_raw"].iloc[0]), 76.5, 1e-9)
 
     cred_damp = C.CRED_FLOOR + C.CRED_SPAN * 70 / 100.0
     price_raw = 58 * cred_damp
@@ -74,7 +74,7 @@ def test_percentile():
 
 
 def test_blank_reweighting():
-    pcts = pd.DataFrame({"v1_ebit_ev": [80.0], "v2_ev_gp": [60.0],
+    pcts = pd.DataFrame({"v1_ebit_ev": [80.0], "v2_gp_ev": [60.0],
                          "v3_fwd_earn_yield": [np.nan], "v4_norm_ep": [40.0],
                          "v5_ev_sales_vs_hist": [np.nan]})
     cols = [k for k, _ in C.VALUE_METRICS]
@@ -126,7 +126,7 @@ def test_value_blanks():
     check_blank("V1: EV <= 0 -> blank",
                 M.v1_ebit_ev({"ev": -1e9, "ebit_ttm": 5e8}))
     check_blank("V2: gross profit <= 0 -> blank",
-                M.v2_ev_gp({"ev": 1e10, "gp_ttm": -1e8}))
+                M.v2_gp_ev({"ev": 1e10, "gp_ttm": -1e8}))
     check_blank("V4: fewer than 3y of margins -> blank",
                 M.v4_norm_ep({"margin_years": 2, "net_margin_5y_avg": 0.1,
                               "rev_ttm": 1e10, "mcap": 1e11}))
@@ -215,7 +215,7 @@ def test_roic_fallback():
           _f["d_nopat_3y"] / 1e9, -0.40, 1e-6)
 
 
-def test_dampeners_can_only_cost():
+def test_quality_is_one_block_and_price_dampener_only_costs():
     raw = pd.DataFrame(index=[0, 1])
     pcts = pd.DataFrame({"q1_roic": [80.0, 80.0], "q2_roiic": [80.0, 80.0],
                          "q3_persistence": [80.0, 80.0],
@@ -226,17 +226,17 @@ def test_dampeners_can_only_cost():
                          "p4_continuity": [100.0, 0.0], "p5_lottery": [100.0, 0.0],
                          "p6_down_resilience": [100.0, 0.0]})
     p = R.build_pillars(raw, pcts)
-    check("perfect shield -> quality raw equals the engine",
-          float(p["quality_raw"].iloc[0]), 80.0)
-    check("worst shield -> engine x 0.6", float(p["quality_raw"].iloc[1]), 48.0)
+    check("flux-2.1: strong protection adds score - mean of six",
+          float(p["quality_raw"].iloc[0]), 90.0)
+    check("weak protection costs in proportion", float(p["quality_raw"].iloc[1]), 40.0)
     check("perfect credibility -> price raw equals strength",
           float(p["price_raw"].iloc[0]), 60.0)
     check("worst credibility -> strength x 0.5", float(p["price_raw"].iloc[1]), 30.0)
     zero = R.build_pillars(pd.DataFrame(index=[0]), pd.DataFrame(
         {"q1_roic": [0.0], "q2_roiic": [0.0], "q3_persistence": [0.0],
          "q4_leverage_score": [100.0], "q5_drawdown": [100.0], "q6_hygiene": [100.0]}))
-    check("no engine -> protection earns nothing",
-          float(zero["quality_raw"].iloc[0]), 0.0)
+    check("no engine, perfect protection -> 50, no longer 0",
+          float(zero["quality_raw"].iloc[0]), 50.0)
 
 
 def test_gates_outside_averages():
@@ -348,7 +348,7 @@ def test_workings_reproduce_the_model():
     for label, f in cases.items():
         m = M.compute_all(f)
         w = W.build(f, m)
-        keys = ["v1_ebit_ev", "v2_ev_gp", "v3_fwd_earn_yield", "q1_roic", "q4_leverage_score"]
+        keys = ["v1_ebit_ev", "v2_gp_ev", "v3_fwd_earn_yield", "q1_roic", "q4_leverage_score"]
         ok = all(w[k]["ok"] for k in keys)
         check(label, "reproduces" if ok else "MISMATCH", "reproduces")
 

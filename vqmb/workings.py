@@ -108,14 +108,14 @@ def build(f: dict, m: dict) -> dict:
         book = _f(f.get("book_tangible") if kind_fin == "insurer" else f.get("book"))
         r = book / mcap if _ok(book, mcap) and mcap > 0 else NA
         lab = "Tangible book" if kind_fin == "insurer" else "Book equity"
-        w["v2_ev_gp"] = _entry(f"{lab.lower()} ÷ market cap",
+        w["v2_gp_ev"] = _entry(f"{lab.lower()} ÷ market cap",
             [[lab, book, "$"], ["Market cap", mcap, "$"]],
-            "Book / price", r, "x", m.get("v2_ev_gp"),
-            "financials variant; higher is cheaper here, the opposite of EV/GP")
+            "Book / price", r, "x", m.get("v2_gp_ev"),
+            "financials variant; higher is cheaper, like gross profit / EV")
     else:
         gp = _f(f.get("gp_ttm"))
-        r = ev / gp if _ok(ev, gp) and gp > 0 and ev > 0 else NA
-        note = "lower is cheaper"
+        r = gp / ev if _ok(ev, gp) and gp > 0 and ev > 0 else NA
+        note = "higher is cheaper - a gross-profit yield"
         if f.get("gp_quality") in ("none", "mixed") and not _ok(gp):
             note = ("set aside: the vendor reports no cost of revenue for "
                     + ("any quarter" if f.get("gp_quality") == "none" else "some quarters")
@@ -124,10 +124,10 @@ def build(f: dict, m: dict) -> dict:
         elif _ok(gp) and gp <= 0:
             note += "; blank because gross profit ≤ 0"
         elif not _ok(ev) or ev <= 0:
-            note = "blank because EV ≤ 0 or missing - a negative EV/GP would read as the cheapest name"
-        w["v2_ev_gp"] = _entry("enterprise value ÷ TTM gross profit",
-            ev_inputs + [["Gross profit, TTM", gp, "$"]],
-            "EV / gross profit", r, "x", m.get("v2_ev_gp"), note)
+            note = "blank because EV ≤ 0 or missing - a negative yield would misrank the name"
+        w["v2_gp_ev"] = _entry("TTM gross profit ÷ enterprise value",
+            [["Gross profit, TTM", gp, "$"]] + ev_inputs,
+            "Gross profit / EV", r, "%", m.get("v2_gp_ev"), note)
 
     eps, cov = _f(f.get("ntm_eps")), _f(f.get("ntm_coverage"))
     basis = str(f.get("fwd_basis") or "")
@@ -180,16 +180,28 @@ def build(f: dict, m: dict) -> dict:
              ["5-year average ROE", roe5, "%"], ["Book equity", book, "$"], ["Market cap", mcap, "$"]],
             "Normalized E/P", r, "%", m.get("v4_norm_ep"))
     else:
-        m5, rev = _f(f.get("net_margin_5y_avg")), _f(f.get("rev_ttm"))
+        m5, rev = _f(f.get("net_margin_5y_avg")), _f(f.get("v4_rev"))
         r = (m5 * rev / mcap if _ok(m5, rev, mcap) and mcap > 0
              and _f(f.get("margin_years")) >= C.MIN_AVG_YEARS else NA)
-        w["v4_norm_ep"] = _entry("5y avg net margin × TTM revenue ÷ market cap",
+        rb = str(f.get("v4_rev_basis") or "none")
+        how = {"ntm": "consensus, fiscal years blended over the next twelve months",
+               "fy_fallback": "consensus, nearest fiscal year not yet ended (blend under 80% coverage)",
+               "calc": "model-built: TTM revenue × (1 + g) - no usable consensus",
+               "calc_guard": (f"model-built: TTM revenue × (1 + g) - consensus is under "
+                              f"{(C.NTM_REV_BASIS_FLOOR or 0):.0%} of TTM revenue, so on a different basis"),
+               "none": "no NTM revenue: no usable consensus and no growth projection"}[rb]
+        w["v4_norm_ep"] = _entry("5y avg net margin × NTM revenue ÷ market cap",
             [["Annual net margins, newest first",
               ", ".join(f"{x*100:.1f}%" for x in (f.get("w_margins") or [])), "t"],
-             ["5-year average net margin", m5, "%"], ["Revenue, TTM", rev, "$"],
-             ["Market cap", mcap, "$"]],
+             ["5-year average net margin", m5, "%"],
+             ["Revenue, TTM", _f(f.get("rev_ttm")), "$"],
+             ["Consensus NTM revenue", _f(f.get("v4_rev_consensus")), "$"],
+             ["Revenue analysts", _f(f.get("v4_rev_analysts")), "d"],
+             ["Projection growth g", _f(f.get("g_projection")), "%"],
+             ["NTM revenue used", rev, "$"], ["Market cap", mcap, "$"]],
             "Normalized E/P", r, "%", m.get("v4_norm_ep"),
-            "mid-cycle margins on today's revenue; blank with fewer than 3 years of margins")
+            f"mid-cycle margin on next year's revenue. NTM revenue: {how}. "
+            "Blank with fewer than 3 years of margins")
 
     if fin:
         book = _f(f.get("book"))
@@ -409,6 +421,9 @@ def build(f: dict, m: dict) -> dict:
          ["  → percentile (lower bloat better)", pb, "n"]],
         "Hygiene composite", r, "n", m.get("q6_hygiene"),
         "accruals dropped for financials" if fin else "each alone is noisy; together they are the tripwire")
+    if fin and "q6_hygiene" in C.FIN_NOT_APPLICABLE:
+        # not applicable to a bank, NBFC or insurer: not computed, not shown
+        del w["q6_hygiene"]
 
     # ---------------- BIZ MOMENTUM ----------------
     va0, va3 = _f(f.get("w_vol_a0")), _f(f.get("w_vol_a3"))
@@ -488,14 +503,14 @@ def build(f: dict, m: dict) -> dict:
     for key, win, lab_w in (("p1_trend_12_1", "monthly_returns_12_1", "months −12 to −2"),
                             ("p2_trend_6_1", "monthly_returns_6_1", "months −6 to −2")):
         arr = np.asarray([x for x in (f.get(win) or []) if x is not None and math.isfinite(x)], float)
-        mn = float(arr.mean()) if arr.size else NA
+        cum = float(np.prod(1.0 + arr) - 1.0) if arr.size else NA
         sd = float(arr.std(ddof=1)) if arr.size > 1 else NA
         minobs = C.MOM_MIN_OBS_12_1 if key == "p1_trend_12_1" else C.MOM_MIN_OBS_6_1
-        r = mn / sd if arr.size >= minobs and _ok(mn, sd) and sd != 0 else NA
-        w[key] = _entry("mean monthly return ÷ standard deviation",
+        r = cum / sd if arr.size >= minobs and _ok(cum, sd) and sd != 0 else NA
+        w[key] = _entry("compounded window return ÷ standard deviation of monthly returns",
             [[f"Monthly returns, {lab_w}", ", ".join(f"{x*100:+.1f}%" for x in arr), "t"],
-             ["Observations", arr.size, "d"], ["Mean monthly return", mn, "%"],
-             ["Standard deviation", sd, "%"]],
+             ["Observations", arr.size, "d"], ["Compounded window return", cum, "%"],
+             ["Standard deviation of monthly returns", sd, "%"]],
             "Trend-adjusted momentum", r, "n", m.get(key),
             f"the most recent month is skipped because it mean-reverts; at least {minobs} observations")
 
@@ -541,7 +556,7 @@ def build(f: dict, m: dict) -> dict:
                 w[k]["note"] = why
                 w[k]["ok"] = _close(NA, m.get(k))
     if f.get("fx_mismatch"):                              # row 24
-        _set_aside(("v1_ebit_ev", "v2_ev_gp", "v3_fwd_earn_yield", "v4_norm_ep",
+        _set_aside(("v1_ebit_ev", "v2_gp_ev", "v3_fwd_earn_yield", "v4_norm_ep",
                     "v5_ev_sales_vs_hist"),
                    "set aside: statements and price are in different currencies and no "
                    "exchange rate was found, so no value ratio can be trusted")

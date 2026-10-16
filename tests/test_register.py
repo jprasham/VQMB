@@ -69,7 +69,7 @@ def test_register_rows():
               ok(W.build(f, m)["q1_roic"]["ok"]), "yes")
 
     # ---- row 2: V2 blank on negative EV
-    check_blank("row 2: EV -5bn, GP 1bn -> V2 blank", M.v2_ev_gp({"ev": -5e9, "gp_ttm": 1e9}))
+    check_blank("row 2: EV -5bn, GP 1bn -> V2 blank", M.v2_gp_ev({"ev": -5e9, "gp_ttm": 1e9}))
 
     # ---- rows 3 + 4: checklist columns exist, and a missing one raises
     df = pd.DataFrame({f"composite_rank_{C.BASE_PROFILE}": [90.0, 20.0], "grp_base": [89.0, 10.0]})
@@ -133,9 +133,9 @@ def test_register_rows():
                         | {k: [60.0] for k, _ in C.PRICE_STRENGTH}
                         | {k: [np.nan] for k, _ in C.PRICE_CREDIBILITY})
     pil = R.build_pillars(pd.DataFrame(index=pcts.index), pcts)
-    neutral = C.SHIELD_FLOOR + C.SHIELD_SPAN * C.DAMPENER_NEUTRAL_FILL / 100.0
-    check("row 10: blank shield -> neutral dampener, not best case",
-          float(pil["quality_damp"].iloc[0]), neutral, 1e-9)
+    neutral = C.CRED_FLOOR + C.CRED_SPAN * C.DAMPENER_NEUTRAL_FILL / 100.0
+    check("row 10: blank credibility -> neutral dampener, not best case",
+          float(pil["price_damp"].iloc[0]), neutral, 1e-9)
     sg = R.safety_grade(pd.Series([np.nan]), pd.Series([100.0]), pd.Series([False]))
     check("  ...and the same neutral fill in the safety grade",
           float(sg["safety_raw"].iloc[0]),
@@ -237,7 +237,7 @@ def test_register_rows():
     f = {"fx_mismatch": True, "ebit_ttm": 1e9, "ev": 1e10, "gp_ttm": 2e9}
     m = M.compute_all(f)
     check("row 24: FX mismatch -> V1-V5 blank",
-          ok(all(math.isnan(m[k]) for k in ("v1_ebit_ev", "v2_ev_gp", "v4_norm_ep"))), "yes")
+          ok(all(math.isnan(m[k]) for k in ("v1_ebit_ev", "v2_gp_ev", "v4_norm_ep"))), "yes")
     check("  ...and flagged", ok(m["fx_mismatch"]), "yes")
 
     # ---- row 25: never reuse a partial blob
@@ -661,3 +661,123 @@ def test_fx_cache_is_reset_per_fetch(monkeypatch):
     monkeypatch.setattr(FS, "fetch_extra", lambda *a, **k: {"ohlcv": [], "mcap_hist": {}})
     E.fetch_data(["X"], api_key="k", workers=1)
     assert ("ILS", "USD") not in FS._FX_CACHE
+
+
+# --------------------------------------------------------------------------
+# flux-2.1-us model changes (FLUX model changes, October 2026)
+# --------------------------------------------------------------------------
+def _est(days_ahead, rev, n_rev=10):
+    d = (F.TODAY + dt.timedelta(days=days_ahead))
+    return (d, {"date": d.isoformat(), "estimatedRevenueAvg": rev, "numAnalystsRevenue": n_rev})
+
+
+def test_v2_is_gross_profit_over_ev_and_ranks_unchanged():
+    check("V2 = GP / EV", M.v2_gp_ev({"gp_ttm": 2e9, "ev": 8e9}), 0.25, 1e-12)
+    check_blank("GP <= 0 -> blank", M.v2_gp_ev({"gp_ttm": -1e8, "ev": 8e9}))
+    check_blank("EV <= 0 -> blank", M.v2_gp_ev({"gp_ttm": 1e9, "ev": -8e9}))
+    check("financials keep book / price", M.v2_gp_ev({"is_fin": True, "book": 5e9, "mcap": 1e10}), 0.5)
+    gp = pd.Series([1.0, 2.0, 3.0, 5.0])
+    ev = pd.Series([10.0, 9.0, 30.0, 12.0])
+    old = R.percentile(ev / gp, -1)
+    new = R.percentile(gp / ev, dict(C.VALUE_METRICS)["v2_gp_ev"])
+    assert np.allclose(old, new), "every V2 percentile is unchanged"
+    assert C.FIN_DIRECTION_OVERRIDE == {}
+
+
+def test_v4_uses_ntm_revenue_built_like_ntm_eps():
+    cutoff = F.TODAY
+    # blend: half of two fiscal years fall in the next 365 days
+    dated = [_est(182, 100.0), _est(547, 120.0)]
+    out = F.v4_revenue(dated, cutoff, 90.0, 0.05)
+    assert out["v4_rev_basis"] == "ntm" and 100.0 < out["v4_rev"] < 120.0
+    # V4 = 5y margin x NTM revenue / mcap
+    check("V4 on NTM revenue", M.v4_norm_ep({"net_margin_5y_avg": 0.1, "margin_years": 5,
+                                              "v4_rev": 110.0, "mcap": 1000.0}), 0.011, 1e-12)
+    # fewer than 3 revenue analysts -> no consensus -> model-built
+    out = F.v4_revenue([_est(182, 100.0, 2), _est(547, 120.0, 2)], cutoff, 90.0, 0.05)
+    assert out["v4_rev_basis"] == "calc"
+    check("calc = TTM x (1 + g)", out["v4_rev"], 94.5, 1e-9)
+    # basis guard: consensus under 75% of TTM -> model-built, flagged
+    out = F.v4_revenue([_est(182, 60.0), _est(547, 60.0)], cutoff, 100.0, 0.0)
+    assert out["v4_rev_guard"] and out["v4_rev_basis"] == "calc_guard"
+    check("guarded -> TTM x (1 + g)", out["v4_rev"], 100.0, 1e-9)
+    # missing growth stays missing
+    out = F.v4_revenue([], cutoff, 100.0, NA)
+    assert out["v4_rev_basis"] == "none" and math.isnan(out["v4_rev"])
+
+
+def test_v4_basis_guard_rollback(monkeypatch):
+    monkeypatch.setattr(C, "NTM_REV_BASIS_FLOOR", None)
+    out = F.v4_revenue([_est(182, 60.0), _est(547, 60.0)], F.TODAY, 100.0, 0.0)
+    assert not out["v4_rev_guard"] and out["v4_rev_basis"] == "ntm"
+    check("rollback: consensus used", out["v4_rev"], 60.0, 1e-9)
+
+
+def test_quality_is_one_block_hygiene_not_applicable_to_financials():
+    raw = pd.DataFrame({"is_fin": [False, True, False]})
+    pcts = pd.DataFrame({"q1_roic": [60.0, 60.0, 60.0], "q2_roiic": [60.0, 60.0, 60.0],
+                         "q3_persistence": [60.0, 60.0, 60.0],
+                         "q4_leverage_score": [90.0, 90.0, 90.0],
+                         "q5_drawdown": [90.0, 90.0, 90.0],
+                         "q6_hygiene": [30.0, np.nan, np.nan]})
+    p = R.build_pillars(raw, pcts)
+    check("operating: mean of six", float(p["quality_raw"].iloc[0]), (180 + 180 + 30) / 6)
+    check("financial: mean of five, hygiene left out (not 50)",
+          float(p["quality_raw"].iloc[1]), (180 + 180) / 5)
+    check("operating with missing hygiene: neutral 50",
+          float(p["quality_raw"].iloc[2]), (180 + 180 + 50) / 6)
+    check("financial protection: leverage and drawdown only", float(p["protection"].iloc[1]), 90.0)
+    assert "quality_damp" not in p.columns and not hasattr(C, "SHIELD_FLOOR")
+    # financials: hygiene not computed
+    comp = M.hygiene_components({"is_fin": True, "shares_a0": 1.1e9, "shares_3y": 1e9,
+                                 "sbc_ttm": 1e8, "rev_ttm": 1e10})
+    assert all(math.isnan(v) for v in comp.values())
+
+
+def test_hygiene_rollback_restores_neutral_fill(monkeypatch):
+    monkeypatch.setattr(C, "FIN_NOT_APPLICABLE", ())
+    raw = pd.DataFrame({"is_fin": [True]})
+    pcts = pd.DataFrame({k: [60.0] for k, _ in C.QUALITY_METRICS} | {"q6_hygiene": [np.nan]})
+    check("rollback: financial hygiene is neutral 50",
+          float(R.build_pillars(raw, pcts)["quality_raw"].iloc[0]), (300 + 50) / 6)
+
+
+def test_p1_p2_use_compounded_window_return():
+    r = [0.10, -0.05, 0.02, 0.04, 0.03, -0.01, 0.06, 0.02, 0.01, 0.05, -0.02]
+    sd = float(np.std(r, ddof=1))
+    check("P1 = (prod(1+r) - 1) / SD", M.p1_trend_12_1({"monthly_returns_12_1": r}),
+          (float(np.prod([1 + x for x in r])) - 1) / sd, 1e-12)
+    # same mean monthly return, different compounded total -> rank apart
+    a, b = [0.10, -0.10, 0.10, -0.10, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]
+    b = [0.02, -0.02, 0.02, -0.02, 0.0]
+    assert M.p2_trend_6_1({"monthly_returns_6_1": a}) != M.p2_trend_6_1({"monthly_returns_6_1": b})
+
+
+def test_checklist_quality_rank_and_financials_out_of_nine():
+    df = pd.DataFrame({"is_fin": [False, True], f"composite_rank_{C.BASE_PROFILE}": [80.0, 80.0],
+                       "grp_base": [70.0, 70.0], "v_rank_s": [70.0, 70.0], "q_rank_u": [75.0, 75.0],
+                       "leverage_ok": [100.0, np.nan], "b_rank_u": [75.0, 75.0],
+                       "p_rank_u": [75.0, 75.0], "price_credibility": [60.0, 60.0],
+                       "q6_hygiene_pct": [50.0, np.nan]})
+    out = R.checklist(df)
+    assert out["Quality rank >= 70"].tolist() == ["PASS", "PASS"]
+    assert out["Hygiene >= 40"].tolist() == ["PASS", "N/A"]
+    assert out["item_count"].tolist() == [10, 9]
+    assert out["pass_count"].tolist() == [9, 7]
+
+
+def test_run_carries_spec_and_financial_hygiene_is_blank():
+    data, bench = _data()
+    for t in ("S03", "S11"):                          # make two names banks
+        prof = data[t]["blob"]["profile"][0]
+        prof["sector"], prof["industry"] = "Financial Services", "Banks - Regional"
+    full = E._run_full(data, bench, workers=1)
+    assert full.attrs["spec_version"] == "flux-2.1-us"
+    fin = full["is_fin"].fillna(False).astype(bool)
+    if fin.any():
+        assert full.loc[fin, "q6_hygiene_pct"].isna().all()
+        assert not full.loc[fin, "flag_HYGIENE"].any()
+    out = E.to_output(full, C.BASE_PROFILE)
+    assert len(E.COLUMNS) == 146 and list(out.columns) == E.COLUMNS
+    assert (out["checklist_items"] == np.where(out["fin_mode"] == 1, 9, 10)).all()
+    assert not out.loc[out["fin_mode"] == 1, "neutral_fill_metrics"].str.contains("hygiene").any()

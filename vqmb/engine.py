@@ -255,7 +255,7 @@ def score(df: pd.DataFrame, previous_flags: pd.DataFrame | None = None) -> pd.Da
     df["triple"] = R.conviction(df, C.BASE_PROFILE)["triple"]
 
     dd_pct = R.percentile(df["q5_drawdown"], -1)
-    df = pd.concat([df, R.safety_grade(df["quality_shield"], dd_pct, df["gated"])], axis=1)
+    df = pd.concat([df, R.safety_grade(df["protection"], dd_pct, df["gated"])], axis=1)
 
     prev_flags = None
     if previous_flags is not None:
@@ -273,8 +273,9 @@ def score(df: pd.DataFrame, previous_flags: pd.DataFrame | None = None) -> pd.Da
     df["ad"] = DV.ad_grade(df.get("ad_ratio", pd.Series(np.nan, index=df.index)))
     chk = R.checklist(df)
     df["checklist_passes"] = chk["pass_count"]
+    df["checklist_items"] = chk["item_count"]
     for c in chk.columns:
-        if c != "pass_count":
+        if c not in ("pass_count", "item_count"):
             df[f"chk::{c}"] = chk[c]
 
     df = pd.concat([df, pcts.add_prefix("pct_")], axis=1)
@@ -385,7 +386,7 @@ def _previous_state(previous) -> pd.DataFrame | None:
 # model metric key -> output column name
 METRIC_NAMES = {
     "v1_ebit_ev": "ebit_to_ev",
-    "v2_ev_gp": "ev_to_gp",
+    "v2_gp_ev": "gp_to_ev",
     "v3_fwd_earn_yield": "fwd_earn_yield",
     "v4_norm_ep": "normalized_ep",
     "v5_ev_sales_vs_hist": "ev_sales_vs_hist",
@@ -414,15 +415,15 @@ GROUP_COLUMNS = ["group_raw", "group", "grp", "grp_base"]
 # the ten checklist items, named as config.CHECKLIST labels them, then the pass
 # count and the leverage item's own 100/0 input
 CHECKLIST_COLUMNS = ([f"chk::{label}" for label, _, _ in C.CHECKLIST]
-                     + ["checklist_passes", "leverage_ok"])
+                     + ["checklist_passes", "checklist_items", "leverage_ok"])
 
 COLUMNS = (
     ["symbol", "company", "sector", "industry", "country", "price", "mktcap", "fin_mode"]
     + list(METRIC_NAMES.values())
     + [f"u_{n}" for n in METRIC_NAMES.values()]
     + [f"s_{n}" for n in METRIC_NAMES.values()]
-    + ["blk_value", "blk_q_engine", "blk_q_shield", "blk_b_mom", "blk_p_strength", "blk_p_cred",
-       "shield_dampener", "credibility_dampener", "V_raw", "Q_raw", "B_raw", "P_raw",
+    + ["blk_value", "blk_quality", "protection", "blk_b_mom", "blk_p_strength", "blk_p_cred",
+       "credibility_dampener", "V_raw", "Q_raw", "B_raw", "P_raw",
        "V", "Q", "B", "P", "s_V", "s_Q", "s_B", "s_P",
        "profile", "composite", "rank"]
     + [f"composite_{p}" for p in C.PROFILES]
@@ -480,10 +481,10 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
         out[f"u_{name}"] = num(f"pct_{key}")
     for key, name in METRIC_NAMES.items():
         out[f"s_{name}"] = num(f"pct_{key}__S")
-    for col, src in (("blk_value", "value_raw"), ("blk_q_engine", "quality_engine"),
-                     ("blk_q_shield", "quality_shield"), ("blk_b_mom", "biz_raw"),
+    for col, src in (("blk_value", "value_raw"), ("blk_quality", "quality_raw"),
+                     ("protection", "protection"), ("blk_b_mom", "biz_raw"),
                      ("blk_p_strength", "price_strength"), ("blk_p_cred", "price_credibility"),
-                     ("shield_dampener", "quality_damp"), ("credibility_dampener", "price_damp"),
+                     ("credibility_dampener", "price_damp"),
                      ("V_raw", "value_raw"), ("Q_raw", "quality_raw"), ("B_raw", "biz_raw"),
                      ("P_raw", "price_raw"), ("V", "v_rank_u"), ("Q", "q_rank_u"),
                      ("B", "b_rank_u"), ("P", "p_rank_u"), ("s_V", "v_rank_s"),
@@ -514,6 +515,7 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     for label, _, _ in C.CHECKLIST:
         out[f"chk::{label}"] = full[f"chk::{label}"] if f"chk::{label}" in full.columns else None
     out["checklist_passes"] = num("checklist_passes")
+    out["checklist_items"] = num("checklist_items")
     out["leverage_ok"] = num("leverage_ok")
     out["ev"] = num("ev")
     out["net_debt"] = num("net_debt")
@@ -541,9 +543,12 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     out["rev_yoy_q0"] = num("vol_yoy_q0")
     out["short_history"] = flag("short_history")
     out["short_history_metrics"] = [_short_history_metrics(r) for r in rows]
-    # which ranked metrics had no percentile and so counted as the neutral 50
+    # which ranked metrics had no percentile and so counted as the neutral 50 -
+    # never a metric that does not apply (hygiene on a financial)
     if C.METRIC_NEUTRAL_FILL_ON:
-        blank = {name: num(f"pct_{key}").isna() for key, name in METRIC_NAMES.items()}
+        fin = flag("is_fin") == 1
+        blank = {name: num(f"pct_{key}").isna() & ~(fin & (key in C.FIN_NOT_APPLICABLE))
+                 for key, name in METRIC_NAMES.items()}
         out["neutral_fill_metrics"] = ["|".join(n for n, b in blank.items() if b.iloc[i])
                                        for i in range(len(full))]
     else:
@@ -611,6 +616,7 @@ def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
 
     df.attrs = {
         "as_of": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "spec_version": C.SPEC_VERSION,
         "profile": profile,
         "names_in": len(tickers), "names_scored": int(len(df)),
         "gated": int(df["gated"].fillna(False).sum()),

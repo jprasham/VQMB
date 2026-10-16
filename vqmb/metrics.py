@@ -89,14 +89,15 @@ def v1_ebit_ev(f: dict) -> float:
     return _safe_div(f.get("ebit_ttm"), ev)
 
 
-def v2_ev_gp(f: dict) -> float:
-    """EV / gross profit, inv. The Meta-catcher: a company expensing heavy
-    growth investment through the P&L looks dear on EBIT and cheap on gross
-    profit, which is the least-manipulated profitability line. Finds good
-    businesses whose earnings are suppressed by their own spending.
+def v2_gp_ev(f: dict) -> float:
+    """TTM gross profit / EV, higher better (flux-2.1; was EV / GP, lower
+    better - for positive GP and EV the reciprocal, so every percentile is
+    unchanged). The Meta-catcher: a company expensing heavy growth investment
+    through the P&L looks dear on EBIT and cheap on gross profit, the
+    least-manipulated profitability line.
 
-    Financials: book / price instead (direction flips to higher-better, see
-    FIN_DIRECTION_OVERRIDE). GP <= 0 -> blank."""
+    Financials: book / price instead (tangible book for insurers) - also
+    higher = cheaper, so no direction override is needed. GP <= 0 -> blank."""
     if f.get("is_fin"):
         book = _f(f.get("book_tangible") if f.get("fin_kind") == "insurer"
                   else f.get("book"))
@@ -104,11 +105,11 @@ def v2_ev_gp(f: dict) -> float:
     gp, ev = _f(f.get("gp_ttm")), _f(f.get("ev"))
     if not _ok(gp) or gp <= 0:
         return NA
-    # row 2: a negative EV gives a negative EV/GP that would rank as the
-    # cheapest name in the universe - blank it, the same rule as V1
+    # row 2: a negative EV gives a negative yield that would rank as the
+    # dearest name in the universe - blank it, the same rule as V1
     if not _ok(ev) or ev <= 0:
         return NA
-    return ev / gp
+    return gp / ev
 
 
 def v3_fwd_earn_yield(f: dict) -> tuple[float, dict]:
@@ -168,10 +169,15 @@ def v3_fwd_earn_yield(f: dict) -> tuple[float, dict]:
 
 
 def v4_norm_ep(f: dict) -> float:
-    """(5y average net margin x TTM revenue) / mcap, higher better.
+    """(5y average net margin x NTM revenue) / mcap, higher better.
 
-    The cycle lens — mid-cycle margins on current revenue answers "what does
-    this earn through a cycle?", the anti-peak-margin device. When the spot
+    flux-2.1: what the company would earn NEXT year at its mid-cycle margin.
+    On last year's revenue fast growers looked expensive. NTM revenue
+    (facts: v4_rev) is built like NTM EPS - blend, >= 3 revenue analysts,
+    fallback - with the basis guard, and model-built TTM x (1 + g) when there
+    is no usable consensus.
+
+    The cycle lens — the anti-peak-margin device. When the spot
     lenses (V1, V3) and the cycle lenses (V4, V5) disagree widely, the value
     pillar is making a margin bet and the card must say so.
 
@@ -186,7 +192,7 @@ def v4_norm_ep(f: dict) -> float:
     m5 = _f(f.get("net_margin_5y_avg"))
     if not _ok(m5):
         return NA
-    return _safe_div(m5 * _f(f.get("rev_ttm")), f.get("mcap"))
+    return _safe_div(m5 * _f(f.get("v4_rev")), f.get("mcap"))
 
 
 def v5_ev_sales_vs_hist(f: dict) -> float:
@@ -209,7 +215,7 @@ def v5_ev_sales_vs_hist(f: dict) -> float:
 
 
 # ===========================================================================
-# QUALITY — engine x shield (§6)
+# QUALITY — one block of six, equal weight (§6, flux-2.1)
 # ===========================================================================
 def effective_tax(rate) -> float:
     """A company's effective rate, clamped to 0-35% (§6). Falls back to the
@@ -374,8 +380,12 @@ def q6_hygiene(f: dict, pcts: dict | None = None) -> float:
 
 
 def hygiene_components(f: dict) -> dict:
-    """The three raw inputs to Q6, each 'higher is worse'."""
+    """The three raw inputs to Q6, each 'higher is worse'. Not computed for
+    financials when Q6 is in config.FIN_NOT_APPLICABLE (flux-2.1): accruals
+    and bloat are built for industrial balance sheets."""
     out = {}
+    if f.get("is_fin") and "q6_hygiene" in C.FIN_NOT_APPLICABLE:
+        return {"accruals": NA, "dilution": NA, "bloat": NA}
     if f.get("is_fin"):
         out["accruals"] = NA          # dropped: no provisioning data
     else:
@@ -443,7 +453,9 @@ def b3_margin_delta(f: dict) -> float:
 # PRICE MOMENTUM — strength x credibility (§8)
 # ===========================================================================
 def p1_trend_12_1(f: dict) -> float:
-    """Mean of monthly returns m-12..m-2 divided by their standard deviation.
+    """Compounded return over m-12..m-2 divided by the standard deviation of
+    those monthly returns (flux-2.1; was the mean monthly return - the actual
+    window return is what a holder earned).
     The canonical momentum window, volatility-honest — a steady climb beats the
     same total return delivered in lurches. Skip-month convention: the most
     recent month is excluded because it mean-reverts."""
@@ -465,7 +477,7 @@ def _trend(returns, min_obs) -> float:
     sd = r.std(ddof=1)
     if not math.isfinite(sd) or sd == 0:
         return NA
-    return float(r.mean() / sd)
+    return float((np.prod(1.0 + r) - 1.0) / sd)
 
 
 def p3_high_distance(f: dict) -> float:
@@ -533,7 +545,7 @@ def compute_all(f: dict) -> dict:
     out["fin_kind"] = f.get("fin_kind")
 
     out["v1_ebit_ev"] = v1_ebit_ev(f)
-    out["v2_ev_gp"] = v2_ev_gp(f)
+    out["v2_gp_ev"] = v2_gp_ev(f)
     v3, tags = v3_fwd_earn_yield(f)
     out["v3_fwd_earn_yield"] = v3
     out.update(tags)
@@ -567,7 +579,7 @@ def compute_all(f: dict) -> dict:
     # value lens would divide one currency by another, so all five are set aside
     out["fx_mismatch"] = bool(f.get("fx_mismatch"))
     if out["fx_mismatch"]:
-        for k in ("v1_ebit_ev", "v2_ev_gp", "v3_fwd_earn_yield", "v4_norm_ep",
+        for k in ("v1_ebit_ev", "v2_gp_ev", "v3_fwd_earn_yield", "v4_norm_ep",
                   "v5_ev_sales_vs_hist"):
             out[k] = NA
     # row 34: a stale last price bar blanks every price metric

@@ -3,8 +3,8 @@ VQMB — the rank chain (handbook §3, §9, §10, §11, §13, §16).
 
     metric raw values
       -> metric percentiles, computed twice: within universe (U) and sector (S)
-      -> pillar raw: mean of available metric percentiles; Quality and Price
-         multiply by a dampener
+      -> pillar raw: mean of metric percentiles; Price multiplies by the
+         credibility dampener (flux-2.1: Quality is one plain block)
       -> pillar ranks: pillar raw re-percentiled -> RNK.U and RNK.S
       -> composite raw: profile-weighted sum of pillar RNK.U
       -> composite rank: re-percentiled within universe, per profile
@@ -89,8 +89,27 @@ def percentile_within(df: pd.DataFrame, col: str, group_col: str | None,
 # ---------------------------------------------------------------------------
 # blanks and reweighting (§13) - one law
 # ---------------------------------------------------------------------------
-def block_mean(pcts: pd.DataFrame, cols: list[str]) -> pd.Series:
+def not_applicable_mask(raw: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """True where a metric does not exist for that name: the metrics in
+    config.FIN_NOT_APPLICABLE, on financials. Those cells are left out of a
+    block mean entirely - not neutral-filled."""
+    mask = pd.DataFrame(False, index=raw.index, columns=cols)
+    fin = raw.get("is_fin")
+    if fin is None:
+        return mask
+    fin = fin.fillna(False).astype(bool)
+    for c in cols:
+        if c in C.FIN_NOT_APPLICABLE:
+            mask[c] = fin
+    return mask
+
+
+def block_mean(pcts: pd.DataFrame, cols: list[str],
+               not_applicable: pd.DataFrame | None = None) -> pd.Series:
     """Mean of the percentiles in one sub-block.
+
+    `not_applicable` (same columns) marks cells that do not exist for a name;
+    they are dropped from that name's mean under either rule below.
 
     With config.METRIC_NEUTRAL_FILL_ON, a blank metric counts as the neutral
     percentile (50) and the mean runs over every metric in the sub-block. The
@@ -102,39 +121,42 @@ def block_mean(pcts: pd.DataFrame, cols: list[str]) -> pd.Series:
     already a 0-100 percentile, an equal-weight mean of whatever survives IS
     the reweighting rule; nothing further is needed.
     """
+    block = pcts.reindex(columns=cols)
     if C.METRIC_NEUTRAL_FILL_ON:
         # a metric never computed for anyone is a column of blanks - neutral too
-        return pcts.reindex(columns=cols).fillna(C.METRIC_NEUTRAL_FILL).mean(axis=1)
-    have = [c for c in cols if c in pcts.columns]
-    if not have:
+        block = block.fillna(C.METRIC_NEUTRAL_FILL)
+    elif not any(c in pcts.columns for c in cols):
         return pd.Series(np.nan, index=pcts.index, dtype="float64")
-    return pcts[have].mean(axis=1, skipna=True)
+    if not_applicable is not None:
+        block = block.mask(not_applicable.reindex(index=block.index, columns=cols,
+                                                  fill_value=False))
+    return block.mean(axis=1, skipna=True)
 
 
 # ---------------------------------------------------------------------------
 # pillars
 # ---------------------------------------------------------------------------
 def build_pillars(raw: pd.DataFrame, pcts: pd.DataFrame) -> pd.DataFrame:
-    """Pillar raw scores, with the two dampeners applied before re-ranking."""
+    """Pillar raw scores, with the price dampener applied before re-ranking."""
     out = pd.DataFrame(index=raw.index)
 
-    out["value_raw"] = block_mean(pcts, [k for k, _ in C.VALUE_METRICS])
+    def blk(metrics):
+        cols = [k for k, _ in metrics]
+        return block_mean(pcts, cols, not_applicable_mask(raw, cols))
 
-    engine = block_mean(pcts, [k for k, _ in C.QUALITY_ENGINE])
-    shield = block_mean(pcts, [k for k, _ in C.QUALITY_SHIELD])
-    out["quality_engine"] = engine
-    out["quality_shield"] = shield
-    # Multiplicative on purpose: a fragile balance sheet does not subtract a
-    # fixed amount from quality, it discounts all of it. And protection with no
-    # engine earns nothing - engine 0 stays 0 whatever the shield.
-    # row 10: a blank shield is neutral, not best case
-    out["quality_damp"] = C.SHIELD_FLOOR + C.SHIELD_SPAN * shield.fillna(C.DAMPENER_NEUTRAL_FILL) / 100.0
-    out["quality_raw"] = engine * out["quality_damp"]
+    out["value_raw"] = blk(C.VALUE_METRICS)
 
-    out["biz_raw"] = block_mean(pcts, [k for k, _ in C.BIZ_METRICS])
+    # flux-2.1: Quality is the plain equal-weight mean of all six metrics (five
+    # for financials, which have no hygiene). Balance-sheet strength now adds
+    # score in proportion rather than only discounting the engine.
+    out["quality_raw"] = blk(C.QUALITY_METRICS)
+    # protection: leverage, drawdown, hygiene - feeds the Safety grade only
+    out["protection"] = blk(C.QUALITY_SHIELD)
 
-    strength = block_mean(pcts, [k for k, _ in C.PRICE_STRENGTH])
-    cred = block_mean(pcts, [k for k, _ in C.PRICE_CREDIBILITY])
+    out["biz_raw"] = blk(C.BIZ_METRICS)
+
+    strength = blk(C.PRICE_STRENGTH)
+    cred = blk(C.PRICE_CREDIBILITY)
     out["price_strength"] = strength
     out["price_credibility"] = cred
     out["price_damp"] = C.CRED_FLOOR + C.CRED_SPAN * cred.fillna(C.DAMPENER_NEUTRAL_FILL) / 100.0
@@ -254,13 +276,14 @@ def conviction(df: pd.DataFrame, profile: str) -> pd.DataFrame:
     return out
 
 
-def safety_grade(shield: pd.Series, drawdown_pct: pd.Series,
+def safety_grade(protection: pd.Series, drawdown_pct: pd.Series,
                  gated: pd.Series) -> pd.DataFrame:
     """Absolute by design - a fortress is a fortress regardless of peers, so
     fixed bands rather than universe quintiles (contrast A/D, which is
-    relative). Any gate forces E."""
-    # row 10: the same neutral fill the pillar dampener uses, not worst case
-    raw = (C.SAFETY_SHIELD_W * shield.fillna(C.DAMPENER_NEUTRAL_FILL)
+    relative). Any gate forces E. `protection` is the mean percentile of
+    leverage, drawdown and hygiene (leverage and drawdown for financials)."""
+    # row 10: a missing protection score is neutral, not worst case
+    raw = (C.SAFETY_SHIELD_W * protection.fillna(C.DAMPENER_NEUTRAL_FILL)
            + C.SAFETY_DRAWDOWN_W * drawdown_pct.fillna(0.0))
 
     def band(x):
@@ -366,12 +389,19 @@ def group_layer(df: pd.DataFrame, profile: str, group_col: str = "group") -> pd.
 
 def checklist(df: pd.DataFrame) -> pd.DataFrame:
     """Ten items, PASS / NEUTRAL (within 10 points) / FAIL, pinned to the
-    TRADER profile for every user by design. No data -> NEUTRAL."""
+    TRADER profile for every user by design. No data -> NEUTRAL. An item that
+    reads a metric in config.FIN_NOT_APPLICABLE is N/A for financials, which
+    are then scored out of nine (`item_count`)."""
     out = pd.DataFrame(index=df.index)
     passes = pd.Series(0, index=df.index)
+    items = pd.Series(0, index=df.index)
+    fin = df.get("is_fin")
+    fin = (fin.fillna(False).astype(bool) if fin is not None
+           else pd.Series(False, index=df.index))
     for label, col, bar in C.CHECKLIST:
         if col is None:
             out[label] = "NEUTRAL"          # B4 removed -> revisions item is permanently neutral
+            items += 1
             continue
         if col not in df.columns:
             # row 4: fail loudly. Reading a wrong column name as "no data" is
@@ -382,7 +412,12 @@ def checklist(df: pd.DataFrame) -> pd.DataFrame:
         res = pd.Series("NEUTRAL", index=df.index, dtype="object")
         res[v >= bar] = "PASS"
         res[v < bar - C.CHECKLIST_NEUTRAL_BAND] = "FAIL"
-        out[label] = res.where(v.notna(), "NEUTRAL")
-        passes += (out[label] == "PASS").astype(int)
+        res = res.where(v.notna(), "NEUTRAL")
+        if any(col == m or col.startswith(f"{m}_") for m in C.FIN_NOT_APPLICABLE):
+            res[fin] = "N/A"
+        out[label] = res
+        passes += (res == "PASS").astype(int)
+        items += (res != "N/A").astype(int)
     out["pass_count"] = passes
+    out["item_count"] = items
     return out
