@@ -1,8 +1,7 @@
 # VQMB
 
 A quantitative stock-ranking model packaged as a Python library. It implements
-FLUX spec **flux-2.1-us** (written to `df.attrs["spec_version"]`), plus the
-VQMB-only departures documented below. It has four sub-models:
+the FLUX model. It has four sub-models:
 
 | Pillar | Letter | What it measures |
 |---|---|---|
@@ -32,6 +31,12 @@ pip install git+https://github.com/jprasham/VQMB.git
 
 This needs Python 3.9 or later. The dependencies are `numpy`, `pandas` and
 `requests`.
+
+Whenever the library changes, reinstall it and restart Python:
+
+```bash
+pip install --force-reinstall --no-deps git+https://github.com/jprasham/VQMB.git
+```
 
 ## Quick start
 
@@ -107,7 +112,8 @@ Progress and warnings go to the standard `logging` logger named `"vqmb"`.
 by `rank` (best first). The list is `vqmb.engine.COLUMNS`. Blank (`NaN`)
 always means "not computable". The model never fills a blank with zero. A
 blank metric keeps a blank `u_`/`s_` percentile, but counts as a neutral 50
-inside its sub-block's average (see `neutral_fill_metrics`). Flag-like columns are `1`/`0`. Multi-value text columns are
+inside its pillar's average when the pillar has at least one real metric (see
+`neutral_fill_metrics`). Flag-like columns are `1`/`0`. Multi-value text columns are
 pipe-separated.
 
 ### Identity (8)
@@ -131,19 +137,29 @@ networks stay on the standard set.
 
 ↓ = lower is better.
 
-- `gp_to_ev` = TTM gross profit ÷ EV, a gross-profit yield (was EV ÷ gross
-  profit before flux-2.1; every percentile is unchanged). Financials use book ÷
+- `gp_to_ev` = TTM gross profit ÷ EV, a gross-profit yield (the reciprocal of
+  EV ÷ gross profit, so every percentile is the same). Financials use book ÷
   price (tangible book for insurers), also higher = cheaper.
-- `normalized_ep` = 5-year average net margin × **NTM revenue** ÷ market cap.
-  NTM revenue is built like NTM EPS: fiscal years blended over the next 365
-  days (≥ 80% coverage, else the nearest unclosed year), at least 3 revenue
-  analysts, else model-built TTM revenue × (1 + g). Consensus below 75% of TTM
-  revenue (`NTM_REV_BASIS_FLOOR`) is treated as a different basis and the
-  model-built figure is used. Financials: 5-year average ROE × book ÷ market cap.
+- `normalized_ep` = normalized revenue × normalized margin ÷ market cap,
+  **one-sided**: it can only lower earnings versus today, never raise them.
+  Built on up to 7 years of annual revenue, net income and operating income
+  (`config.NE_PARAMS`). A name is cyclical if revenue fell more than 10% in a
+  year, the margin (operating where every year has it, else net) fell more
+  than 5 points or jumped more than 10 points in a year, or its sector /
+  industry matches `NE_CYCLICAL_KEYWORDS`. Cyclical: revenue = lower of TTM
+  and trend revenue, margin = lower of latest and average. Not cyclical:
+  revenue = lower of TTM and latest FY × (1 + g), margin = latest. Earnings
+  are capped at TTM revenue × latest margin. Fewer than 3 years, a year
+  without revenue or net income, or no market cap → blank. Financials: 5-year
+  average ROE × book ÷ market cap.
 - `trend_12_1`, `trend_6_1` = the compounded window return (months −12 to −2,
   −6 to −2) ÷ the standard deviation of those monthly returns.
 - `hygiene` is not applicable to financials: not computed, not scored, not in
   the checklist, and not neutral-filled (`FIN_NOT_APPLICABLE`).
+- Forward revenue (`fwd_rev_ntm`) is context only and feeds no metric. It is
+  built like NTM EPS: fiscal years blended over the next 365 days (≥ 80%
+  coverage, `NTM_MIN_COVERAGE`), else the nearest unfinished fiscal year, with
+  at least 3 revenue analysts.
 
 ### Percentiles (40)
 
@@ -166,7 +182,7 @@ networks stay on the standard set.
 | `blk_p_cred` | Mean of the P4–P6 percentiles. |
 | `credibility_dampener` | `0.5 + 0.5 × credibility/100`. A blank credibility counts as 50. |
 | `V_raw`, `B_raw` | Equal to `blk_value` and `blk_b_mom`. |
-| `Q_raw` | Equal to `blk_quality` - no dampener since flux-2.1. |
+| `Q_raw` | Equal to `blk_quality` - Quality has no dampener. |
 | `P_raw` | `blk_p_strength × credibility_dampener`. |
 | `V`, `Q`, `B`, `P` | The pillar raw scores re-ranked 0–100 against the universe. |
 | `s_V`, `s_Q`, `s_B`, `s_P` | The same pillar raw scores re-ranked 0–100 within the name's sector. Diagnostic only; never feeds the composite. |
@@ -181,8 +197,8 @@ networks stay on the standard set.
 | `rank_TRADER` / `_PM` / `_GROWTH` | Each profile's score re-ranked 0–100. |
 
 A name needs at least 2 of the 4 pillars to get a composite. Otherwise it is
-blank and flagged THIN. With the neutral fill on, a pillar is never blank (a
-sub-block with every metric blank scores 50), so THIN does not fire.
+blank and flagged THIN. A pillar with no real metric stays blank - it is
+never filled with 50.
 
 ### Industry group (4)
 
@@ -218,7 +234,7 @@ set. Column names come from `config.CHECKLIST`.
 | `chk::RNK >= 75` | TRADER composite rank | 75 |
 | `chk::GRP >= 60` | `grp_base` | 60 |
 | `chk::Value S-rank >= 60` | `s_V` | 60 |
-| `chk::Quality rank >= 70` | `Q` | 70 |
+| `chk::Quality >= 70` | `Q` | 70 |
 | `chk::Net cash or ND/EBIT < 1` | `leverage_ok` | 50 |
 | `chk::B >= 70` | `B` | 70 |
 | `chk::Revisions >= 60` | none - always `NEUTRAL` | 60 |
@@ -253,7 +269,7 @@ set. Column names come from `config.CHECKLIST`.
 | `rev_cagr_3y`, `rev_yoy_q0` | The two legs of `latest_q_vs_3y`, measured on the volume line: revenue for most companies, pre-provision profit for banks and lenders. |
 | `short_history` | `1` when a history minimum isn't met. |
 | `short_history_metrics` | Which of `drawdown_history`, `growth_persistence` and `ev_sales_vs_hist` are short of history. |
-| `neutral_fill_metrics` | The ranked metrics that were blank and counted as a neutral 50 in their sub-block. Empty when all 20 are present. |
+| `neutral_fill_metrics` | The ranked metrics that were blank and counted as a neutral 50 in their pillar (only where the pillar had a real metric; never hygiene on a financial). |
 
 ### `df.attrs` (run-level information, not columns)
 
@@ -271,6 +287,7 @@ set. Column names come from `config.CHECKLIST`.
 | `workings_mismatch`, `implausible_moves` | Names listed for review. |
 | `groups` | The industry-group table. |
 | `market_vitals` | Seven universe-wide readings, each with a value and a verdict. |
+| `sector_lens` | Sector Lens for each profile: `{profile: {"sectors": [...], "pairs": [...], "headline": {...}}}`. Unscored - nothing feeds back into the ranks. `pd.DataFrame(df.attrs["sector_lens"]["TRADER"]["sectors"])` gives the table. |
 
 ---
 
@@ -282,12 +299,12 @@ use a variant formula for 12 of the metrics, and those metrics rank
 financials only against other financials. The two rankings are then spliced
 into one column.
 
-**Pillars.** A blank metric counts as a neutral percentile of 50, and every
-sub-block is the equal-weight mean of all its metrics. Example: B1 blank, B2 at
-80, B3 at 60 → business momentum = (50 + 80 + 60) / 3 = 63.3. Weight never
-moves across sub-blocks. This differs from FLUX, which drops a blank and
-averages the rest; `config.METRIC_NEUTRAL_FILL_ON = False` restores the FLUX
-rule.
+**Pillars.** A blank metric counts as a neutral percentile of 50 in its
+pillar's average, when the pillar has at least one real metric. Example: B1
+blank, B2 at 80, B3 at 90 → business momentum = (50 + 80 + 90) / 3 = 73.3. A
+pillar with no real metric stays blank. The price pillar counts strength and
+credibility together. `config.MISSING_METRIC_FILL = None` restores reweighting
+among the metrics present.
 A metric that does not apply (hygiene on a financial) is left out of the
 mean, not filled with 50.
 Quality = the mean of its six percentiles (five for financials). Price =
@@ -342,8 +359,9 @@ The tests include:
 
 - the reference worked example: quality as the mean of six, price dampener at
   credibility 70, and composites of 70 / 74.625 / 75.7
-- one check per flux-2.1 change (V2, V4 on NTM revenue and its basis guard,
-  Quality as one block, hygiene N/A for financials, compounded P1/P2)
+- one check per model change (V2, one-sided normalized V4, the neutral 50 for
+  a missing metric, Quality as one block, hygiene N/A for financials,
+  compounded P1/P2, Sector Lens)
 - one check per data-quality rule
 - a full synthetic-universe run through the engine
 

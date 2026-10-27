@@ -49,11 +49,6 @@ PROFILES = {
 }
 BASE_PROFILE = "TRADER"
 
-# The FLUX model spec this library implements. Written into df.attrs so every
-# output says which model produced it. (VQMB keeps its documented departures
-# from FLUX on top of this spec - see METRIC_NEUTRAL_FILL_ON.)
-SPEC_VERSION = "flux-2.1-us"
-
 # --------------------------------------------------------------------------
 # Pillar structure. Each metric is (key, direction) where direction is
 # +1 "higher raw ranks higher" or -1 "lower raw ranks higher" (the inv marker).
@@ -66,26 +61,17 @@ VALUE_METRICS = [
     ("v4_norm_ep", +1),
     ("v5_ev_sales_vs_hist", -1),
 ]
-QUALITY_ENGINE = [("q1_roic", +1), ("q2_roiic", +1), ("q3_persistence", +1)]
-QUALITY_SHIELD = [("q4_leverage_score", +1), ("q5_drawdown", -1), ("q6_hygiene", -1)]
-# flux-2.1: Quality is ONE block, the equal-weight mean of all six percentiles.
-# The engine / shield lists remain only to name the protection score behind the
-# Safety grade (leverage, drawdown, hygiene).
-QUALITY_METRICS = QUALITY_ENGINE + QUALITY_SHIELD
-
-# Metrics that do not exist for financials (banks, NBFCs, insurers). They are
-# not computed, not scored and not shown for those names, and are LEFT OUT of
-# the block mean - never given the neutral fill, which is for data that should
-# exist but is missing. Rollback: FIN_NOT_APPLICABLE = ()
-FIN_NOT_APPLICABLE = ("q6_hygiene",)
+# Quality is ONE equal-weight block of six. Financials score on five - hygiene
+# does not apply to them (FIN_NOT_APPLICABLE) and carries no weight.
+QUALITY_METRICS = [("q1_roic", +1), ("q2_roiic", +1), ("q3_persistence", +1),
+                   ("q4_leverage_score", +1), ("q5_drawdown", -1), ("q6_hygiene", -1)]
 BIZ_METRICS = [("b1_vs_trend", +1), ("b2_sequential", +1), ("b3_margin_delta", +1)]
 PRICE_STRENGTH = [("p1_trend_12_1", +1), ("p2_trend_6_1", +1), ("p3_high_distance", +1)]
 PRICE_CREDIBILITY = [("p4_continuity", +1), ("p5_lottery", -1), ("p6_down_resilience", +1)]
 
-# metrics whose direction flips under the financials variant. Empty since
-# flux-2.1: V2 is gross profit / EV, so its financials variant (book / price)
-# already reads the same way - higher is cheaper.
-FIN_DIRECTION_OVERRIDE = {}
+# metrics whose direction flips under the financials variant (none: V2 is gross
+# profit / EV and the financials' book / price are both yields)
+FIN_DIRECTION_OVERRIDE: dict = {}
 
 # Metrics whose FORMULA differs for financials (§12). These are ranked within
 # the FIN group only and the resulting percentile is spliced into the U column,
@@ -104,19 +90,19 @@ VARIANT_METRICS = {
     "q2_roiic",            # ROIIC          -> incremental ROE
     "q3_persistence",      # on revenue     -> on PPOP / GWP
     "q4_leverage_score",   # ND/EBIT curve  -> equity/assets curve
+    "q6_hygiene",          # accruals dropped, bloat redefined
     "b1_vs_trend",         # volume line    -> PPOP / GWP
     "b2_sequential",
     "b3_margin_delta",     # gross margin   -> NIM / combined ratio
 }
 
-ALL_METRICS = (VALUE_METRICS + QUALITY_ENGINE + QUALITY_SHIELD + BIZ_METRICS
+ALL_METRICS = (VALUE_METRICS + QUALITY_METRICS + BIZ_METRICS
                + PRICE_STRENGTH + PRICE_CREDIBILITY)
 METRIC_COUNT = len(ALL_METRICS)                # 20
 
 # --------------------------------------------------------------------------
 # Dampener (§8) — multiplies inside the price pillar, before re-ranking. It
 # can only ever COST score: floor + span * (x/100), = 1.0 at x = 100.
-# flux-2.1: the quality shield dampener is gone; this is the only dampener.
 # --------------------------------------------------------------------------
 CRED_FLOOR, CRED_SPAN = 0.5, 0.5            # price:    0.5 + 0.5 * cred/100
 
@@ -166,7 +152,10 @@ CONFLICT_SPREAD_ON, CONFLICT_SPREAD_OFF = 75.0, 65.0
 # Safety grade (§16) — display only, ABSOLUTE by design (a fortress is a
 # fortress regardless of peers). Contrast with A/D, which is relative.
 # --------------------------------------------------------------------------
-SAFETY_SHIELD_W, SAFETY_DRAWDOWN_W = 0.6, 0.4
+# protection = mean percentile of leverage, drawdown and hygiene (leverage and
+# drawdown only for financials), each missing one at the neutral fill
+SAFETY_PROTECTION_METRICS = ("q4_leverage_score", "q5_drawdown", "q6_hygiene")
+SAFETY_PROTECTION_W, SAFETY_DRAWDOWN_W = 0.6, 0.4
 SAFETY_BANDS = [(85, "A"), (70, "B"), (50, "C"), (30, "D"), (0, "E")]
 
 # --------------------------------------------------------------------------
@@ -219,7 +208,7 @@ CHECKLIST = [
     ("RNK >= 75", f"composite_rank_{BASE_PROFILE}", 75.0),
     ("GRP >= 60", "grp_base", 60.0),
     ("Value S-rank >= 60", "v_rank_s", 60.0),
-    ("Quality rank >= 70", "q_rank_u", 70.0),
+    ("Quality >= 70", "q_rank_u", 70.0),
     # leverage_ok is 100 (pass) or 0 (fail), so a bar of 50 can actually fail (row 5)
     ("Net cash or ND/EBIT < 1", "leverage_ok", 50.0),
     ("B >= 70", "b_rank_u", 70.0),
@@ -228,6 +217,9 @@ CHECKLIST = [
     ("Credibility >= 50", "price_credibility", 50.0),
     ("Hygiene >= 40", "q6_hygiene_pct", 40.0),
 ]
+# checklist items that do not apply to financials: shown as N/A for them and
+# left out of their pass count (so a financial is scored out of 9)
+CHECKLIST_FIN_NOT_APPLICABLE = ("Hygiene >= 40",)
 CHECKLIST_NEUTRAL_BAND = 10.0   # within 10 points of the bar -> NEUTRAL, not FAIL
 
 # --------------------------------------------------------------------------
@@ -366,14 +358,16 @@ MISSING_EBIT_GATES = False
 # and worst case in the other
 DAMPENER_NEUTRAL_FILL = 50.0
 
-# A metric that is blank (missing or not computable) inside a pillar counts as
-# a neutral percentile of 50 in its sub-block mean, instead of dropping out and
-# re-averaging the rest. Applies to every sub-block of all four pillars (V,
-# Q, B, P strength, P credibility). The metric's own u_/s_
-# percentile stays blank, so what was filled is still visible.
-# Deliberate departure from FLUX, which drops the blank. False restores FLUX.
-METRIC_NEUTRAL_FILL_ON = True
-METRIC_NEUTRAL_FILL = 50.0
+# Missing metrics inside a pillar. A metric that cannot be computed takes this
+# neutral percentile in its pillar's average, rather than being dropped while
+# its siblings reweight. Applied only when the pillar has at least one real
+# metric - a pillar with none stays blank, so a name with no data is never
+# ranked as average and the 2-of-4-pillars composite rule still applies. The
+# price pillar counts strength and credibility together. The published
+# per-metric percentiles stay blank: only the pillar sees the fill. Metrics in
+# FIN_NOT_APPLICABLE are never filled for financials. Set to None to restore
+# reweighting among the metrics present.
+MISSING_METRIC_FILL = 50.0
 
 # row 6 - one line per issuer: dual share classes (GOOG/GOOGL) carry the same
 # statements and would otherwise count twice in every percentile
@@ -408,14 +402,42 @@ NTM_FALLBACK_MIN_DAYS_AHEAD = 0
 # rows 19-20 - every five-year average needs at least this many years
 MIN_AVG_YEARS = 3
 
-# V4 (normalized E/P) on next-twelve-months revenue, built with the NTM EPS
-# rules: fiscal-year blend at >= 80% coverage, else the nearest unclosed fiscal
-# year; at least MIN_ANALYSTS revenue analysts; no consensus -> TTM revenue x
-# (1 + g). Basis guard: consensus below this share of TTM revenue is on a
-# different basis (net vs gross revenue, a spin-off already excluded) and the
-# model-built figure is used instead. Rollback: NTM_REV_BASIS_FLOOR = None
-NTM_REV_BASIS_FLOOR = 0.75
+# NTM revenue (shown as context, fwd_rev) is built exactly like NTM EPS:
+# fiscal-year consensus blended by overlap with the coming 365 days (needs
+# NTM_MIN_COVERAGE), else the nearest fiscal year not yet ended; at least
+# MIN_ANALYSTS behind it (read from this field). It does not feed any metric.
+NTM_MIN_COVERAGE = 0.80
 REV_ANALYST_COUNT_FIELD = "numAnalystsRevenue"
+
+# V4 normalized E/P (operating companies):
+#   normalized revenue x normalized margin / market cap, ONE-SIDED - it can only
+#   lower earnings versus today, never raise them, so temporarily inflated sales
+#   or margins stop making a stock look cheap.
+# A company is cyclical if, over its annual history (operating margin where
+# every year has operating income, else net margin): revenue fell more than
+# rev_fall in a year, the margin fell more than margin_fall or jumped more than
+# margin_jump in a year, or its sector / industry contains a keyword below.
+#   g      = revenue CAGR, first year -> second-to-last
+#   trend  = median revenue x (1 + g) ^ ((N + 1) / 2)
+#   avg    = min(mean net margin, sum net income / sum revenue), margins clipped
+#            to +/- winsor
+#   not cyclical: revenue = min(TTM, latest FY x (1 + g)); margin = latest FY
+#   cyclical:     revenue = min(TTM, trend);               margin = min(latest, avg)
+#   earnings      = min(revenue x margin, TTM revenue x latest margin)
+# Fewer than min_years of history, any year without revenue > 0 or net income,
+# or no market cap -> blank. Financials keep 5y avg ROE x book / market cap.
+NE_PARAMS = dict(min_years=3, max_years=7, rev_fall=0.10, margin_fall=0.05,
+                 margin_jump=0.10, winsor=0.50)
+NE_CYCLICAL_KEYWORDS = ("energy", "oil", "gas", "basic materials", "chemical", "steel",
+                        "metal", "mining", "gold", "copper", "aluminum", "paper",
+                        "semiconductor", "memory", "hardware", "auto", "airline",
+                        "shipping", "marine", "trucking", "residential construction",
+                        "homebuild", "building materials")
+
+# Metrics that do not apply to financials (banks, NBFCs, insurers). They are
+# blank for those names and carry NO weight in the pillar - they are not given
+# the neutral MISSING_METRIC_FILL, because "does not apply" is not "missing".
+FIN_NOT_APPLICABLE = ("q6_hygiene",)
 
 # row 37 - daily moves beyond this are reported for review, never dropped
 IMPLAUSIBLE_DAILY_MOVE = 0.40          # 40%, not the register's 50%: a real 2-for-1 split day
@@ -458,3 +480,45 @@ SHARE_BASIS_TOLERANCE = 0.25
 # Currency that dollar volume is expressed in, so share classes and
 # cross-listings trading in different currencies compare like with like.
 TURNOVER_CURRENCY = "USD"
+
+
+# --------------------------------------------------------------------------
+# Sector Lens - a top-down read of what the market is rewarding by
+# group, and long/short pair candidates WITHIN each group. Uses only ranks and
+# grades the model already computes; nothing is re-estimated and nothing imputed.
+# A "sector" here is the model group (§14). Weights come from PROFILES.
+# --------------------------------------------------------------------------
+LENS_MIN_NAMES = 4                    # below this a sector is faded and never paired
+LENS_BREADTH_RANK = 70.0              # breadth: share of names ranked at least this
+LENS_LAGGARD_RANK = 30.0              # laggards: share ranked at most this
+LENS_DISPERSION_MIN_N = 3             # IQR of rank only with this many names
+LENS_DISPERSION_WIDE = 35.0           # IQR >= this -> WIDE  ("pairs pay")
+LENS_DISPERSION_TIGHT = 20.0          # IQR <  this -> TIGHT ("trade the sector")
+LENS_REGIME_HIGH = 55.0               # median B and P: >= high is strong...
+LENS_REGIME_LOW = 45.0                # ...< low is weak; anything between is MIXED
+LENS_LEADERS = 3                      # sectors in each of the leaders / laggards sets
+LENS_PILLAR_GAP_CLEAR = 15.0          # headline: a leaders-minus-laggards gap this big is "clear"
+LENS_PILLAR_GAP_FLAT = 10.0           # ...and one smaller than this "barely separates"
+# pair eligibility
+LENS_LONG_MIN_RANK = 65.0
+LENS_LONG_MIN_P = 45.0
+LENS_LONG_BAD_AD = ("E",)
+LENS_LONG_BAD_SAFETY = ("E",)
+LENS_LONG_BAD_FLAGS = ("GATE", "STALE", "LOSS")
+LENS_SHORT_RANK_FLOOR = 40.0          # short: rank <= max(floor, min(cap, sector p33))
+LENS_SHORT_RANK_CAP = 50.0
+LENS_SHORT_RANK_PCTL = 33.0
+LENS_SHORT_MAX_B = 45.0               # ...and B <= this OR P <= the next
+LENS_SHORT_MAX_P = 40.0
+LENS_SHORT_BAD_FLAGS = ("STALE",)
+LENS_MIN_SPREAD = 35.0
+LENS_VALUE_PENALTY = 0.15             # score = spread - 0.15 * max(0, -dV - 30)
+LENS_VALUE_PENALTY_FREE = 30.0
+LENS_MAX_PAIRS = 2                    # per sector; each name used once
+# pair tags
+LENS_TAG_VALUE_CLEAN = 20.0           # |dV| <= this -> style-clean on value
+LENS_TAG_VALUE_BIG = 40.0             # dV >= this cheaper / <= -this paying up
+LENS_TAG_TAPE_B_SHARE = 0.20          # tape-only: B share < this and P share > next
+LENS_TAG_TAPE_P_SHARE = 0.45
+LENS_TAG_SHORT_STRONG_P = 60.0
+LENS_TAG_SQUEEZE_V, LENS_TAG_SQUEEZE_Q = 75.0, 60.0

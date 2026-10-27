@@ -128,8 +128,7 @@ def test_register_rows():
                 M.v5_ev_sales_vs_hist({"ev": -5e9, "rev_ttm": 1e10, "ev_sales_median_hist": 2.0}))
 
     # ---- row 10: one neutral fill in both places
-    pcts = pd.DataFrame({k: [80.0] for k, _ in C.QUALITY_ENGINE}
-                        | {k: [np.nan] for k, _ in C.QUALITY_SHIELD}
+    pcts = pd.DataFrame({k: [80.0] for k, _ in C.QUALITY_METRICS}
                         | {k: [60.0] for k, _ in C.PRICE_STRENGTH}
                         | {k: [np.nan] for k, _ in C.PRICE_CREDIBILITY})
     pil = R.build_pillars(pd.DataFrame(index=pcts.index), pcts)
@@ -139,7 +138,7 @@ def test_register_rows():
     sg = R.safety_grade(pd.Series([np.nan]), pd.Series([100.0]), pd.Series([False]))
     check("  ...and the same neutral fill in the safety grade",
           float(sg["safety_raw"].iloc[0]),
-          C.SAFETY_SHIELD_W * C.DAMPENER_NEUTRAL_FILL + C.SAFETY_DRAWDOWN_W * 100.0, 1e-9)
+          C.SAFETY_PROTECTION_W * C.DAMPENER_NEUTRAL_FILL + C.SAFETY_DRAWDOWN_W * 100.0, 1e-9)
 
     # ---- row 11: missing EBIT is not a gate; every gate has a cause
     lev, gate = M.q4_leverage_score({"net_debt": 5e9})
@@ -473,9 +472,14 @@ def test_output_is_the_documented_columns():
         assert out[c].isin(["PASS", "NEUTRAL", "FAIL"]).all(), c
     assert ((out[chk] == "PASS").sum(axis=1) == out["checklist_passes"]).all()
     # neutral_fill_metrics names exactly the metrics with a blank u_ percentile
-    for name in E.METRIC_NAMES.values():
-        listed = out["neutral_fill_metrics"].str.split("|").apply(lambda xs, n=name: n in xs)
-        assert (listed == out[f"u_{name}"].isna()).all(), name
+    # in a pillar that has at least one real metric (and that apply to the name)
+    for keys in R.PILLAR_METRICS.values():
+        names = [E.METRIC_NAMES[k] for k in keys]
+        has_real = out[[f"u_{n}" for n in names]].notna().any(axis=1)
+        for k, name in zip(keys, names):
+            na = (out["fin_mode"] == 1) & (k in C.FIN_NOT_APPLICABLE)
+            listed = out["neutral_fill_metrics"].str.split("|").apply(lambda xs, n=name: n in xs)
+            assert (listed == (out[f"u_{name}"].isna() & has_real & ~na)).all(), name
     # short_history_metrics is filled exactly when short_history is on
     assert ((out["short_history"] == 1) == (out["short_history_metrics"] != "")).all()
 
@@ -664,11 +668,11 @@ def test_fx_cache_is_reset_per_fetch(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# flux-2.1-us model changes (FLUX model changes, October 2026)
+# Model changes, October 2026
 # --------------------------------------------------------------------------
 def _est(days_ahead, rev, n_rev=10):
     d = (F.TODAY + dt.timedelta(days=days_ahead))
-    return (d, {"date": d.isoformat(), "estimatedRevenueAvg": rev, "numAnalystsRevenue": n_rev})
+    return {"date": d.isoformat(), "estimatedRevenueAvg": rev, "numAnalystsRevenue": n_rev}
 
 
 def test_v2_is_gross_profit_over_ev_and_ranks_unchanged():
@@ -684,33 +688,83 @@ def test_v2_is_gross_profit_over_ev_and_ranks_unchanged():
     assert C.FIN_DIRECTION_OVERRIDE == {}
 
 
-def test_v4_uses_ntm_revenue_built_like_ntm_eps():
-    cutoff = F.TODAY
-    # blend: half of two fiscal years fall in the next 365 days
-    dated = [_est(182, 100.0), _est(547, 120.0)]
-    out = F.v4_revenue(dated, cutoff, 90.0, 0.05)
-    assert out["v4_rev_basis"] == "ntm" and 100.0 < out["v4_rev"] < 120.0
-    # V4 = 5y margin x NTM revenue / mcap
-    check("V4 on NTM revenue", M.v4_norm_ep({"net_margin_5y_avg": 0.1, "margin_years": 5,
-                                              "v4_rev": 110.0, "mcap": 1000.0}), 0.011, 1e-12)
-    # fewer than 3 revenue analysts -> no consensus -> model-built
-    out = F.v4_revenue([_est(182, 100.0, 2), _est(547, 120.0, 2)], cutoff, 90.0, 0.05)
-    assert out["v4_rev_basis"] == "calc"
-    check("calc = TTM x (1 + g)", out["v4_rev"], 94.5, 1e-9)
-    # basis guard: consensus under 75% of TTM -> model-built, flagged
-    out = F.v4_revenue([_est(182, 60.0), _est(547, 60.0)], cutoff, 100.0, 0.0)
-    assert out["v4_rev_guard"] and out["v4_rev_basis"] == "calc_guard"
-    check("guarded -> TTM x (1 + g)", out["v4_rev"], 100.0, 1e-9)
-    # missing growth stays missing
-    out = F.v4_revenue([], cutoff, 100.0, NA)
-    assert out["v4_rev_basis"] == "none" and math.isnan(out["v4_rev"])
+# V4 archetypes: (revenue, net income, TTM revenue, market cap, extra facts)
+_NE = {
+    "micron_peak": ([21.44, 27.71, 30.76, 15.54, 25.11, 37.38, 133.19],
+                    [2.69, 5.86, 8.69, -5.83, 0.778, 8.54, 84.97], 282.31, 1160, {}),
+    "micron_3y": ([25.11, 37.38, 133.19], [0.778, 8.54, 84.97], 282.31, 1160, {}),
+    "micron_fy23": ([21.44, 27.71, 30.76, 15.54], [2.69, 5.86, 8.69, -5.83], 25.11, 75, {}),
+    "acme": ([100, 80, 120, 140, 160], [8, 2, 12, 17, 22], 200, 200, {}),
+    "stable": ([143, 168, 198, 212, 245, 281, 318], [44, 61, 73, 72, 88, 101, 115], 360, 3500, {}),
+    "hypergrowth": ([100, 170, 260, 360, 460, 560, 660], [-15, -10, 0, 25, 60, 95, 130], 780, 4000, {}),
+    "decliner": ([78, 79, 63, 54, 53, 53], [21, 20, 8, 1.7, -18.8, -0.3], 55, 150, {}),
+    "acquirer": ([100, 108, 116, 125, 135, 146, 300], [30, 32, 35, 37, 40, 44, 90], 320, 1500, {}),
+    "quiet_semi": ([100, 105, 111, 117, 124, 131, 139], [20, 21, 22, 24, 25, 27, 29], 150, 600,
+                   {"sector": "Technology", "industry": "Semiconductors"}),
+    "impairment": ([143, 168, 198, 212, 245, 281, 318], [44, 61, 73, 72, 20, 101, 115], 360, 3500,
+                   {"ne_oi": [57, 79, 95, 94, 114, 131, 150]}),
+    "short": ([100, 110], [10, 11], 120, 100, {}),
+}
 
 
-def test_v4_basis_guard_rollback(monkeypatch):
-    monkeypatch.setattr(C, "NTM_REV_BASIS_FLOOR", None)
-    out = F.v4_revenue([_est(182, 60.0), _est(547, 60.0)], F.TODAY, 100.0, 0.0)
-    assert not out["v4_rev_guard"] and out["v4_rev_basis"] == "ntm"
-    check("rollback: consensus used", out["v4_rev"], 60.0, 1e-9)
+def _ne_facts(k):
+    r, n, c, mc, kw = _NE[k]
+    return {"ne_rev": r, "ne_ni": n, "ne_oi": [NA] * len(r), "rev_ttm": c, "mcap": mc,
+            "ne_dates": [f"20{19 + i}-12-31" for i in range(len(r))], **kw}
+
+
+def test_v4_normalized_earnings_is_one_sided():
+    res = {k: M.normalized_earnings(_ne_facts(k)) for k in _NE}
+
+    def naive(k):
+        r, n, c, mc, _ = _NE[k]
+        return c * max(min(n[-1] / r[-1], .5), -.5) / mc
+
+    above = [k for k, x in res.items() if not math.isnan(x["yield"]) and x["yield"] > naive(k) + 1e-12]
+    assert above == [], "one-sided: never above today's run rate"
+    assert res["micron_peak"]["yield"] < 0.25 * naive("micron_peak"), "a peak is cut by > 75%"
+    assert res["micron_3y"]["cyclical"] and "margin_jump" in res["micron_3y"]["why"]
+    assert res["acme"]["cyclical"] and "rev_fall" in res["acme"]["why"]
+    for k in ("stable", "hypergrowth", "acquirer"):
+        assert not res[k]["cyclical"], k
+        check(f"{k}: not cyclical, equals today's run rate", res[k]["yield"], naive(k), 1e-9)
+    assert res["quiet_semi"]["why"] == "industry"
+    assert not res["impairment"]["cyclical"], "operating margin ignores a net-income one-off"
+    assert res["impairment"]["margin_basis"] == "operating"
+    assert res["micron_fy23"]["yield"] < 0, "a loss-maker stays negative"
+    assert math.isnan(res["short"]["yield"]) and res["short"]["blank"] == "insufficient_history"
+    bad = dict(_ne_facts("stable"), ne_rev=[143, NA, 198, 212])
+    assert M.normalized_earnings(bad)["blank"] == "bad_history"
+    assert M.normalized_earnings(dict(_ne_facts("stable"), mcap=NA))["blank"] == "no_market_cap"
+
+
+def test_v4_wiring_compute_all_financials_and_workings():
+    f = dict(_ne_facts("micron_peak"), is_fin=False)
+    check("compute_all ranks the normalized yield as V4", M.compute_all(f)["v4_norm_ep"],
+          M.normalized_earnings(f)["yield"], 1e-12)
+    # financials keep 5y average ROE x book / market cap
+    fin = {"is_fin": True, "roe_5y_avg": 0.12, "roe_years": 5, "book": 50.0, "mcap": 100.0}
+    check("financial V4 = ROE x book / mcap", M.v4_norm_ep(fin), 0.06, 1e-12)
+    # facts carry the annual history oldest first, capped at max_years
+    inc_a = [{"date": f"{2025 - i}-12-31", "revenue": 100.0 + i, "netIncome": 10.0,
+              "operatingIncome": 12.0} for i in range(9)]
+    hist = F.build_facts("H", _blob(income_a=inc_a), {}, {})
+    assert len(hist["ne_rev"]) == C.NE_PARAMS["max_years"]
+    assert hist["ne_dates"] == sorted(hist["ne_dates"]) and hist["ne_rev"][-1] == 100.0
+    # every step shown in the workings reproduces the metric
+    w = W.build(f, M.compute_all(f))["v4_norm_ep"]
+    assert w["ok"], w
+
+
+def test_fwd_rev_is_context_with_ntm_rules():
+    def fwd(est, ttm=90.0):
+        f = F.build_facts("R", _blob(estimates=est), {}, {})
+        return f["fwd_rev"], f["fwd_rev_basis"]
+    v, b = fwd([_est(182, 100.0), _est(547, 120.0)])
+    assert b == "ntm" and 100.0 < v < 120.0
+    v, b = fwd([_est(182, 100.0, 2), _est(547, 120.0, 2)])
+    assert b == "none" and math.isnan(v), "fewer than MIN_ANALYSTS -> no consensus"
+    assert not hasattr(F, "v4_revenue") and not hasattr(C, "NTM_REV_BASIS_FLOOR")
 
 
 def test_quality_is_one_block_hygiene_not_applicable_to_financials():
@@ -726,12 +780,13 @@ def test_quality_is_one_block_hygiene_not_applicable_to_financials():
           float(p["quality_raw"].iloc[1]), (180 + 180) / 5)
     check("operating with missing hygiene: neutral 50",
           float(p["quality_raw"].iloc[2]), (180 + 180 + 50) / 6)
-    check("financial protection: leverage and drawdown only", float(p["protection"].iloc[1]), 90.0)
+    check("financial protection: leverage and drawdown only",
+          float(p["safety_protection"].iloc[1]), 90.0)
     assert "quality_damp" not in p.columns and not hasattr(C, "SHIELD_FLOOR")
     # financials: hygiene not computed
-    comp = M.hygiene_components({"is_fin": True, "shares_a0": 1.1e9, "shares_3y": 1e9,
-                                 "sbc_ttm": 1e8, "rev_ttm": 1e10})
-    assert all(math.isnan(v) for v in comp.values())
+    m = M.compute_all({"is_fin": True, "shares_a0": 1.1e9, "shares_3y": 1e9,
+                       "sbc_ttm": 1e8, "rev_ttm": 1e10})
+    assert all(math.isnan(m[k]) for k in ("hyg_accruals", "hyg_dilution", "hyg_bloat"))
 
 
 def test_hygiene_rollback_restores_neutral_fill(monkeypatch):
@@ -760,19 +815,19 @@ def test_checklist_quality_rank_and_financials_out_of_nine():
                        "p_rank_u": [75.0, 75.0], "price_credibility": [60.0, 60.0],
                        "q6_hygiene_pct": [50.0, np.nan]})
     out = R.checklist(df)
-    assert out["Quality rank >= 70"].tolist() == ["PASS", "PASS"]
+    assert out["Quality >= 70"].tolist() == ["PASS", "PASS"]
     assert out["Hygiene >= 40"].tolist() == ["PASS", "N/A"]
     assert out["item_count"].tolist() == [10, 9]
     assert out["pass_count"].tolist() == [9, 7]
 
 
-def test_run_carries_spec_and_financial_hygiene_is_blank():
+def test_run_has_no_version_label_and_financial_hygiene_is_blank():
     data, bench = _data()
     for t in ("S03", "S11"):                          # make two names banks
         prof = data[t]["blob"]["profile"][0]
         prof["sector"], prof["industry"] = "Financial Services", "Banks - Regional"
     full = E._run_full(data, bench, workers=1)
-    assert full.attrs["spec_version"] == "flux-2.1-us"
+    assert "spec_version" not in full.attrs and not hasattr(C, "SPEC_VERSION")
     fin = full["is_fin"].fillna(False).astype(bool)
     if fin.any():
         assert full.loc[fin, "q6_hygiene_pct"].isna().all()
@@ -781,3 +836,55 @@ def test_run_carries_spec_and_financial_hygiene_is_blank():
     assert len(E.COLUMNS) == 146 and list(out.columns) == E.COLUMNS
     assert (out["checklist_items"] == np.where(out["fin_mode"] == 1, 9, 10)).all()
     assert not out.loc[out["fin_mode"] == 1, "neutral_fill_metrics"].str.contains("hygiene").any()
+
+
+def test_sector_lens_pairs_regimes_and_attrs():
+    from vqmb import sector_lens as L
+    W_ = C.PROFILES["GROWTH"]
+    leg = lambda sym, rnk, v, q, b, p, ad, sf, flags=(): {
+        "sym": sym, "name": sym, "rnk": rnk, "V": v, "Q": q, "B": b, "P": p,
+        "ad": ad, "sf": sf, "dv": "DRIFT", "st": "", "flags": list(flags)}
+    shares = lambda parts: "/".join(str(round(parts[k]["share"] * 100)) for k in "BPQV")
+    mu, qcom = leg("MU", 100, 66, 97, 99, 77, "A", "D"), leg("QCOM", 8, 81, 33, 7, 34, "C", "D")
+    pt = L.decompose(mu, qcom, W_)
+    assert shares(pt) == "57/17/25/-2" and max(pt, key=lambda k: pt[k]["contrib"]) == "B"
+    assert ("/".join(L._regime(b, p) for b, p in ((60, 60), (60, 40), (40, 60), (40, 40), (50, 60)))
+            == "CONFIRMED/TAPE LAGS/TAPE LEADS/BROKEN/MIXED")
+    assert "/".join(L._dispersion(v) for v in (41, 26, 12)) == "WIDE/MODERATE/TIGHT"
+    assert (L.short_bar(pd.Series([10, 20, 30, 90, 95, 99])), L.short_bar(pd.Series([60, 70, 80, 90]))) == (40, 50)
+
+    rows = []
+    def add(sec, sym, rnk, v, q, b, p, **fl):
+        rows.append({"symbol": sym, "company": sym, "group": sec,
+                     **{f"composite_rank_{pr}": rnk for pr in C.PROFILES},
+                     "v_rank_u": v, "q_rank_u": q, "b_rank_u": b, "p_rank_u": p, "ad": "B",
+                     "safety": "B", "darvas": "DRIFT", "darvas_stack": "", "gated": False,
+                     **{f"flag_{k}": True for k in fl}})
+    for i, r in enumerate((95, 92, 90, 88, 86, 84)):
+        add("Block", f"B{i}", r, 30, 70, 85, 80)
+    for i, (r, b, p) in enumerate(((90, 80, 85), (85, 75, 80), (80, 70, 70), (20, 30, 20),
+                                   (15, 20, 30), (10, 25, 10), (50, 50, 50))):
+        add("Spread", f"S{i}", r, 50, 50, b, p)
+    add("Spread", "S7", 99, 50, 50, 90, 95, STALE=True)
+    for i, r in enumerate((60, 30, 20, 10)):
+        add("Weak", f"W{i}", r, 70, 40, 30, 20)
+    add("Tiny", "T0", 90, 50, 50, 50, 50)
+    df = pd.DataFrame(rows)
+    secs, pairs, _ = L.sector_lens(df, "GROWTH")
+    by = secs.set_index("sector")
+    assert (by.loc["Block", "regime"], by.loc["Block", "dispersion"], by.loc["Block", "no_pair"]) == \
+        ("CONFIRMED", "TIGHT", "no_short")
+    assert by.loc["Weak", "no_pair"] == "no_long" and bool(by.loc["Tiny", "thin"])
+    sp = pairs[pairs["sector"] == "Spread"]
+    assert len(sp) == 2 and (sp.iloc[0]["long"], sp.iloc[0]["short"]) == ("S0", "S5")
+    assert "S7" not in set(sp["long"])
+    att = L.lens_attrs(df)
+    assert sorted(att) == sorted(C.PROFILES)
+    json.dumps(att)                                   # plain records, serialisable
+    assert len(att["GROWTH"]["pairs"]) == len(pairs)
+
+    # a real run carries the lens for every profile in attrs
+    data, bench = _data()
+    full = E._run_full(data, bench, workers=1)
+    assert sorted(full.attrs["sector_lens"]) == sorted(C.PROFILES)
+    json.dumps(full.attrs["sector_lens"])

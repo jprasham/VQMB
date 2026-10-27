@@ -90,14 +90,16 @@ def v1_ebit_ev(f: dict) -> float:
 
 
 def v2_gp_ev(f: dict) -> float:
-    """TTM gross profit / EV, higher better (flux-2.1; was EV / GP, lower
-    better - for positive GP and EV the reciprocal, so every percentile is
-    unchanged). The Meta-catcher: a company expensing heavy growth investment
-    through the P&L looks dear on EBIT and cheap on gross profit, the
-    least-manipulated profitability line.
+    """Gross profit / EV, higher better - a gross-profit yield, read the same
+    way as every other value lens. The Meta-catcher: a company expensing heavy
+    growth investment through the P&L looks dear on EBIT and cheap on gross
+    profit, which is the least-manipulated profitability line. Finds good
+    businesses whose earnings are suppressed by their own spending.
 
-    Financials: book / price instead (tangible book for insurers) - also
-    higher = cheaper, so no direction override is needed. GP <= 0 -> blank."""
+    For positive GP and EV it is the reciprocal of EV / gross profit, so the
+    percentile order is identical; only the number shown changes.
+
+    Financials: book / price instead, also higher-better. GP <= 0 -> blank."""
     if f.get("is_fin"):
         book = _f(f.get("book_tangible") if f.get("fin_kind") == "insurer"
                   else f.get("book"))
@@ -169,30 +171,83 @@ def v3_fwd_earn_yield(f: dict) -> tuple[float, dict]:
 
 
 def v4_norm_ep(f: dict) -> float:
-    """(5y average net margin x NTM revenue) / mcap, higher better.
+    """Normalized E/P, higher better.
 
-    flux-2.1: what the company would earn NEXT year at its mid-cycle margin.
-    On last year's revenue fast growers looked expensive. NTM revenue
-    (facts: v4_rev) is built like NTM EPS - blend, >= 3 revenue analysts,
-    fallback - with the basis guard, and model-built TTM x (1 + g) when there
-    is no usable consensus.
+    Operating companies: normalized revenue x normalized margin / market cap,
+    one-sided - see normalized_earnings and config.NE_PARAMS. It stops a stock
+    looking cheap because sales or margins are temporarily inflated, and never
+    credits earnings above today's run rate.
 
-    The cycle lens — the anti-peak-margin device. When the spot
-    lenses (V1, V3) and the cycle lenses (V4, V5) disagree widely, the value
-    pillar is making a margin bet and the card must say so.
-
-    Fewer than 3 years of margin history -> blank."""
+    Financials: 5y average ROE x book / market cap (unchanged)."""
     if f.get("is_fin"):
         roe5, book = _f(f.get("roe_5y_avg")), _f(f.get("book"))
         if not _ok(roe5, book) or not _has_at_least(f.get("roe_years"), C.MIN_AVG_YEARS):
             return NA
         return _safe_div(roe5 * book, f.get("mcap"))
-    if not _has_at_least(f.get("margin_years"), C.MIN_AVG_YEARS):
-        return NA
-    m5 = _f(f.get("net_margin_5y_avg"))
-    if not _ok(m5):
-        return NA
-    return _safe_div(m5 * _f(f.get("v4_rev")), f.get("mcap"))
+    return normalized_earnings(f)["yield"]
+
+
+def _cyclical_label(sector, industry) -> bool:
+    text = " ".join(s.lower() for s in (sector, industry) if isinstance(s, str))
+    return any(k in text for k in C.NE_CYCLICAL_KEYWORDS)
+
+
+def normalized_earnings(f: dict) -> dict:
+    """Every step of V4 for an operating company, so the workings can show them.
+    Annual revenue, net income and operating income come oldest first."""
+    p = C.NE_PARAMS
+    rev = np.asarray(f.get("ne_rev") or [], float)[-p["max_years"]:]
+    ni = np.asarray(f.get("ne_ni") or [], float)[-p["max_years"]:]
+    oi = np.asarray(f.get("ne_oi") or [], float)[-p["max_years"]:]
+    n = len(rev)
+    mcap = _f(f.get("mcap"))
+    out = {"yield": NA, "years": n, "why": "", "cyclical": None}
+    if n < p["min_years"]:
+        out["blank"] = "insufficient_history"
+        return out
+    if not (np.all(np.isfinite(rev)) and np.all(rev > 0) and len(ni) == n and np.all(np.isfinite(ni))):
+        out["blank"] = "bad_history"
+        return out
+    if not (_ok(mcap) and mcap > 0):
+        out["blank"] = "no_market_cap"
+        return out
+    ttm = _f(f.get("rev_ttm"))
+    cur = ttm if _ok(ttm) else float(rev[-1])
+
+    # 1. cyclical test - operating margin when every year has it, so net-income
+    #    one-offs (impairments, tax items) do not trip it
+    w = p["winsor"]
+    m = np.clip(ni / rev, -w, w)
+    use_oi = len(oi) == n and np.all(np.isfinite(oi))
+    tm = np.clip(oi / rev, -w, w) if use_oi else m
+    rev_chg, tm_chg = rev[1:] / rev[:-1] - 1, np.diff(tm)
+    why = [name for name, hit in (
+        ("rev_fall", rev_chg.min() < -p["rev_fall"]),
+        ("margin_fall", tm_chg.min() < -p["margin_fall"]),
+        ("margin_jump", tm_chg.max() > p["margin_jump"]),
+        ("industry", _cyclical_label(f.get("sector"), f.get("industry")))) if hit]
+    cyclical = bool(why)
+
+    # 2. trend revenue and average margin
+    g = float((rev[-2] / rev[0]) ** (1 / (n - 2)) - 1)
+    trend = float(np.median(rev) * (1 + g) ** ((n + 1) / 2))
+    latest = float(m[-1])
+    avg = float(min(m.mean(), ni.sum() / rev.sum()))
+
+    # 3. one-sided normalisation
+    if cyclical:
+        norm_rev, norm_margin = min(cur, trend), min(latest, avg)
+    else:
+        norm_rev, norm_margin = min(cur, float(rev[-1]) * (1 + g)), latest
+    # with a negative margin, less revenue would mean a smaller loss and a
+    # HIGHER yield - never allow earnings above today's run rate
+    earnings = min(norm_rev * norm_margin, cur * latest)
+    out.update({"yield": earnings / mcap, "cyclical": cyclical, "why": "+".join(why),
+                "margin_basis": "operating" if use_oi else "net", "g": g, "trend": trend,
+                "latest": latest, "avg": avg, "cur": cur, "norm_rev": norm_rev,
+                "norm_margin": norm_margin, "earnings": earnings, "mcap": mcap,
+                "run_rate": cur * latest})
+    return out
 
 
 def v5_ev_sales_vs_hist(f: dict) -> float:
@@ -215,7 +270,7 @@ def v5_ev_sales_vs_hist(f: dict) -> float:
 
 
 # ===========================================================================
-# QUALITY — one block of six, equal weight (§6, flux-2.1)
+# QUALITY — one block of six, equal weight (§6)
 # ===========================================================================
 def effective_tax(rate) -> float:
     """A company's effective rate, clamped to 0-35% (§6). Falls back to the
@@ -380,12 +435,8 @@ def q6_hygiene(f: dict, pcts: dict | None = None) -> float:
 
 
 def hygiene_components(f: dict) -> dict:
-    """The three raw inputs to Q6, each 'higher is worse'. Not computed for
-    financials when Q6 is in config.FIN_NOT_APPLICABLE (flux-2.1): accruals
-    and bloat are built for industrial balance sheets."""
+    """The three raw inputs to Q6, each 'higher is worse'."""
     out = {}
-    if f.get("is_fin") and "q6_hygiene" in C.FIN_NOT_APPLICABLE:
-        return {"accruals": NA, "dilution": NA, "bloat": NA}
     if f.get("is_fin"):
         out["accruals"] = NA          # dropped: no provisioning data
     else:
@@ -453,22 +504,29 @@ def b3_margin_delta(f: dict) -> float:
 # PRICE MOMENTUM — strength x credibility (§8)
 # ===========================================================================
 def p1_trend_12_1(f: dict) -> float:
-    """Compounded return over m-12..m-2 divided by the standard deviation of
-    those monthly returns (flux-2.1; was the mean monthly return - the actual
-    window return is what a holder earned).
-    The canonical momentum window, volatility-honest — a steady climb beats the
-    same total return delivered in lurches. Skip-month convention: the most
-    recent month is excluded because it mean-reverts."""
+    """The ACTUAL return over months -12 to -2 (the 11 monthly returns
+    compounded), divided by the standard deviation of those monthly returns.
+    Volatility-honest - a steady climb beats the same total return delivered in
+    lurches. Skip-month convention: the most recent month is excluded because
+    it mean-reverts."""
     return _trend(f.get("monthly_returns_12_1"), C.MOM_MIN_OBS_12_1)
 
 
 def p2_trend_6_1(f: dict) -> float:
-    """The same over m-6..m-2 — the faster clock. With P1 it gives an old trend
-    and a young one."""
+    """The same over months -6 to -2 (5 monthly returns compounded) - the
+    faster clock. With P1 it gives an old trend and a young one."""
     return _trend(f.get("monthly_returns_6_1"), C.MOM_MIN_OBS_6_1)
 
 
+def window_return(returns) -> float:
+    """Compounded return of a run of monthly returns: prod(1 + r) - 1."""
+    r = [x for x in (returns or []) if x is not None and math.isfinite(x)]
+    return float(np.prod([1.0 + x for x in r]) - 1.0) if r else NA
+
+
 def _trend(returns, min_obs) -> float:
+    """Window return / standard deviation of the monthly returns in it
+    (the compounded return, not the mean monthly return)."""
     if returns is None:
         return NA
     r = np.asarray([x for x in returns if x is not None and math.isfinite(x)], dtype=float)
@@ -477,7 +535,7 @@ def _trend(returns, min_obs) -> float:
     sd = r.std(ddof=1)
     if not math.isfinite(sd) or sd == 0:
         return NA
-    return float((np.prod(1.0 + r) - 1.0) / sd)
+    return float(window_return(r.tolist()) / sd)
 
 
 def p3_high_distance(f: dict) -> float:
@@ -563,6 +621,11 @@ def compute_all(f: dict) -> dict:
     out["leverage_gate"] = gate
     out["q5_drawdown"] = q5_drawdown(f)
     out.update({f"hyg_{k}": v for k, v in hygiene_components(f).items()})
+    # hygiene does not apply to financials (config.FIN_NOT_APPLICABLE): no
+    # components, no composite - and no weight in their quality pillar
+    if f.get("is_fin") and "q6_hygiene" in C.FIN_NOT_APPLICABLE:
+        for k in ("hyg_accruals", "hyg_dilution", "hyg_bloat"):
+            out[k] = NA
 
     out["b1_vs_trend"] = b1_vs_trend(f)
     out["b2_sequential"] = b2_sequential(f)

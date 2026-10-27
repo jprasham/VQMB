@@ -35,6 +35,7 @@ from . import facts as F
 from . import fmp
 from . import metrics as M
 from . import ranking as R
+from . import sector_lens as SL
 from . import workings as W
 from .groups import assign_group, resolve_merges
 
@@ -255,7 +256,7 @@ def score(df: pd.DataFrame, previous_flags: pd.DataFrame | None = None) -> pd.Da
     df["triple"] = R.conviction(df, C.BASE_PROFILE)["triple"]
 
     dd_pct = R.percentile(df["q5_drawdown"], -1)
-    df = pd.concat([df, R.safety_grade(df["protection"], dd_pct, df["gated"])], axis=1)
+    df = pd.concat([df, R.safety_grade(df["safety_protection"], dd_pct, df["gated"])], axis=1)
 
     prev_flags = None
     if previous_flags is not None:
@@ -482,7 +483,7 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     for key, name in METRIC_NAMES.items():
         out[f"s_{name}"] = num(f"pct_{key}__S")
     for col, src in (("blk_value", "value_raw"), ("blk_quality", "quality_raw"),
-                     ("protection", "protection"), ("blk_b_mom", "biz_raw"),
+                     ("protection", "safety_protection"), ("blk_b_mom", "biz_raw"),
                      ("blk_p_strength", "price_strength"), ("blk_p_cred", "price_credibility"),
                      ("credibility_dampener", "price_damp"),
                      ("V_raw", "value_raw"), ("Q_raw", "quality_raw"), ("B_raw", "biz_raw"),
@@ -543,12 +544,18 @@ def to_output(full: pd.DataFrame, profile: str) -> pd.DataFrame:
     out["rev_yoy_q0"] = num("vol_yoy_q0")
     out["short_history"] = flag("short_history")
     out["short_history_metrics"] = [_short_history_metrics(r) for r in rows]
-    # which ranked metrics had no percentile and so counted as the neutral 50 -
-    # never a metric that does not apply (hygiene on a financial)
-    if C.METRIC_NEUTRAL_FILL_ON:
+    # which ranked metrics had no percentile and so counted as the neutral 50:
+    # only where the pillar has at least one real metric, and never a metric
+    # that does not apply (hygiene on a financial)
+    if C.MISSING_METRIC_FILL is not None:
         fin = flag("is_fin") == 1
-        blank = {name: num(f"pct_{key}").isna() & ~(fin & (key in C.FIN_NOT_APPLICABLE))
-                 for key, name in METRIC_NAMES.items()}
+        blank = {}
+        for keys in R.PILLAR_METRICS.values():
+            pct = {k: num(f"pct_{k}") for k in keys if k in METRIC_NAMES}
+            has_real = pd.concat(pct.values(), axis=1).notna().any(axis=1)
+            for k, v in pct.items():
+                blank[METRIC_NAMES[k]] = v.isna() & has_real & ~(fin & (k in C.FIN_NOT_APPLICABLE))
+        blank = {name: blank[name] for name in METRIC_NAMES.values() if name in blank}
         out["neutral_fill_metrics"] = ["|".join(n for n, b in blank.items() if b.iloc[i])
                                        for i in range(len(full))]
     else:
@@ -616,7 +623,6 @@ def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
 
     df.attrs = {
         "as_of": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "spec_version": C.SPEC_VERSION,
         "profile": profile,
         "names_in": len(tickers), "names_scored": int(len(df)),
         "gated": int(df["gated"].fillna(False).sum()),
@@ -640,6 +646,7 @@ def _run_full(data: dict, benchmark: dict, profile: str = C.BASE_PROFILE,
                               if isinstance(r.get("implausible_moves"), list) and r["implausible_moves"]},
         "groups": groups.reset_index().to_dict(orient="records"),
         "market_vitals": market_vitals(df, profile),
+        "sector_lens": SL.lens_attrs(df),
     }
     return df
 

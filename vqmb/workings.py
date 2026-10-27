@@ -24,7 +24,7 @@ import math
 import numpy as np
 
 from . import config as C
-from .metrics import effective_tax
+from .metrics import effective_tax, normalized_earnings
 
 NA = float("nan")
 
@@ -111,11 +111,11 @@ def build(f: dict, m: dict) -> dict:
         w["v2_gp_ev"] = _entry(f"{lab.lower()} ÷ market cap",
             [[lab, book, "$"], ["Market cap", mcap, "$"]],
             "Book / price", r, "x", m.get("v2_gp_ev"),
-            "financials variant; higher is cheaper, like gross profit / EV")
+            "financials variant; higher is cheaper")
     else:
         gp = _f(f.get("gp_ttm"))
         r = gp / ev if _ok(ev, gp) and gp > 0 and ev > 0 else NA
-        note = "higher is cheaper - a gross-profit yield"
+        note = "higher is cheaper"
         if f.get("gp_quality") in ("none", "mixed") and not _ok(gp):
             note = ("set aside: the vendor reports no cost of revenue for "
                     + ("any quarter" if f.get("gp_quality") == "none" else "some quarters")
@@ -124,7 +124,7 @@ def build(f: dict, m: dict) -> dict:
         elif _ok(gp) and gp <= 0:
             note += "; blank because gross profit ≤ 0"
         elif not _ok(ev) or ev <= 0:
-            note = "blank because EV ≤ 0 or missing - a negative yield would misrank the name"
+            note = "blank because EV ≤ 0 or missing - a negative EV would make the yield meaningless"
         w["v2_gp_ev"] = _entry("TTM gross profit ÷ enterprise value",
             [["Gross profit, TTM", gp, "$"]] + ev_inputs,
             "Gross profit / EV", r, "%", m.get("v2_gp_ev"), note)
@@ -180,28 +180,41 @@ def build(f: dict, m: dict) -> dict:
              ["5-year average ROE", roe5, "%"], ["Book equity", book, "$"], ["Market cap", mcap, "$"]],
             "Normalized E/P", r, "%", m.get("v4_norm_ep"))
     else:
-        m5, rev = _f(f.get("net_margin_5y_avg")), _f(f.get("v4_rev"))
-        r = (m5 * rev / mcap if _ok(m5, rev, mcap) and mcap > 0
-             and _f(f.get("margin_years")) >= C.MIN_AVG_YEARS else NA)
-        rb = str(f.get("v4_rev_basis") or "none")
-        how = {"ntm": "consensus, fiscal years blended over the next twelve months",
-               "fy_fallback": "consensus, nearest fiscal year not yet ended (blend under 80% coverage)",
-               "calc": "model-built: TTM revenue × (1 + g) - no usable consensus",
-               "calc_guard": (f"model-built: TTM revenue × (1 + g) - consensus is under "
-                              f"{(C.NTM_REV_BASIS_FLOOR or 0):.0%} of TTM revenue, so on a different basis"),
-               "none": "no NTM revenue: no usable consensus and no growth projection"}[rb]
-        w["v4_norm_ep"] = _entry("5y avg net margin × NTM revenue ÷ market cap",
-            [["Annual net margins, newest first",
-              ", ".join(f"{x*100:.1f}%" for x in (f.get("w_margins") or [])), "t"],
-             ["5-year average net margin", m5, "%"],
-             ["Revenue, TTM", _f(f.get("rev_ttm")), "$"],
-             ["Consensus NTM revenue", _f(f.get("v4_rev_consensus")), "$"],
-             ["Revenue analysts", _f(f.get("v4_rev_analysts")), "d"],
-             ["Projection growth g", _f(f.get("g_projection")), "%"],
-             ["NTM revenue used", rev, "$"], ["Market cap", mcap, "$"]],
-            "Normalized E/P", r, "%", m.get("v4_norm_ep"),
-            f"mid-cycle margin on next year's revenue. NTM revenue: {how}. "
-            "Blank with fewer than 3 years of margins")
+        ne = normalized_earnings(f)
+        years = [[d, rv, "$"] for d, rv in zip(f.get("ne_dates") or [], f.get("ne_rev") or [])]
+        nis = [[d, x, "$"] for d, x in zip(f.get("ne_dates") or [], f.get("ne_ni") or [])]
+        ois = [[d, x, "$"] for d, x in zip(f.get("ne_dates") or [], f.get("ne_oi") or [])]
+        inputs = [["Annual revenue, oldest first", None, "t", years],
+                  ["Annual net income", None, "t", nis],
+                  ["Annual operating income", None, "t", ois]]
+        if "blank" in ne:
+            why = {"insufficient_history": f"fewer than {C.NE_PARAMS['min_years']} years of annual statements",
+                   "bad_history": "a year without revenue above zero or without net income",
+                   "no_market_cap": "no market cap"}[ne["blank"]]
+            w["v4_norm_ep"] = _entry("normalized revenue × normalized margin ÷ market cap", inputs,
+                "Normalized E/P", NA, "%", m.get("v4_norm_ep"), "blank: " + why)
+        else:
+            cyc = ne["cyclical"]
+            inputs += [
+                ["Revenue, TTM (today)", ne["cur"], "$"],
+                [f"Cyclical? (tested on {ne['margin_basis']} margin)",
+                 ("yes - " + ne["why"].replace("+", ", ").replace("_", " ")) if cyc else "no", "t"],
+                ["Revenue growth g (first year to second-to-last, CAGR)", ne["g"], "%"],
+                ["Trend revenue = median × (1 + g)^((N + 1) / 2)", ne["trend"], "$"],
+                ["Latest net margin", ne["latest"], "%"],
+                ["Average net margin = lower of mean and Σ NI ÷ Σ revenue", ne["avg"], "%"],
+                ["Normalized revenue = " + ("lower of TTM and trend" if cyc
+                                            else "lower of TTM and latest FY × (1 + g)"), ne["norm_rev"], "$"],
+                ["Normalized margin = " + ("lower of latest and average" if cyc else "latest"),
+                 ne["norm_margin"], "%"],
+                ["Today's run rate = TTM revenue × latest margin", ne["run_rate"], "$"],
+                ["Normalized earnings = lower of the two", ne["earnings"], "$"],
+                ["Market cap", ne["mcap"], "$"]]
+            w["v4_norm_ep"] = _entry("normalized revenue × normalized margin ÷ market cap", inputs,
+                "Normalized E/P", ne["yield"], "%", m.get("v4_norm_ep"),
+                "one-sided: inflated sales or margins are cut, earnings are never raised above today's "
+                "run rate" + ("; cyclical, so revenue is capped at trend and margin at its average"
+                              if cyc else "; not cyclical, so today's margin stands"))
 
     if fin:
         book = _f(f.get("book"))
@@ -223,7 +236,7 @@ def build(f: dict, m: dict) -> dict:
             "Premium to own history", r, "%", m.get("v5_ev_sales_vs_hist"),
             "lower is cheaper; median taken at each of the last five annual statement dates")
 
-    # ---------------- QUALITY - ENGINE ----------------
+    # ---------------- QUALITY (six metrics, equal weight) ----------------
     if fin:
         ni, book = _f(f.get("ni_ttm")), _f(f.get("book"))
         r = ni / book if _ok(ni, book) and book > 0 else NA
@@ -277,7 +290,7 @@ def build(f: dict, m: dict) -> dict:
             else:
                 w["q1_roic"] = _entry("ROIC", base, "ROIC", NA, "%", m.get("q1_roic"),
                     "blank: operating income or invested capital is missing, or both are "
-                    "negative - the other quality-engine metrics carry the weight")
+                    "negative - the other quality metrics carry the weight")
 
     if fin:
         ni0, ni3 = _f(f.get("w_ni_0")), _f(f.get("w_ni_3"))
@@ -335,7 +348,7 @@ def build(f: dict, m: dict) -> dict:
         "Growth persistence", r, "%", m.get("q3_persistence"),
         f"measured on {f.get('w_vol_label', 'revenue')}; at least {need} {unit}s required")
 
-    # ---------------- QUALITY - SHIELD ----------------
+    # ---------------- QUALITY, continued ----------------
     if fin:
         eq, assets = _f(f.get("book")), _f(f.get("assets"))
         cap = _f(f.get("capital_ratio"))
@@ -420,10 +433,10 @@ def build(f: dict, m: dict) -> dict:
          ["Bloat = asset CAGR − revenue CAGR (both FY0 vs FY-3)", blo, "%"],
          ["  → percentile (lower bloat better)", pb, "n"]],
         "Hygiene composite", r, "n", m.get("q6_hygiene"),
-        "accruals dropped for financials" if fin else "each alone is noisy; together they are the tripwire")
-    if fin and "q6_hygiene" in C.FIN_NOT_APPLICABLE:
-        # not applicable to a bank, NBFC or insurer: not computed, not shown
-        del w["q6_hygiene"]
+        "each alone is noisy; together they are the tripwire")
+    if fin:
+        # hygiene does not apply to financials: no entry, nothing shown
+        w.pop("q6_hygiene", None)
 
     # ---------------- BIZ MOMENTUM ----------------
     va0, va3 = _f(f.get("w_vol_a0")), _f(f.get("w_vol_a3"))
@@ -507,9 +520,10 @@ def build(f: dict, m: dict) -> dict:
         sd = float(arr.std(ddof=1)) if arr.size > 1 else NA
         minobs = C.MOM_MIN_OBS_12_1 if key == "p1_trend_12_1" else C.MOM_MIN_OBS_6_1
         r = cum / sd if arr.size >= minobs and _ok(cum, sd) and sd != 0 else NA
-        w[key] = _entry("compounded window return ÷ standard deviation of monthly returns",
+        w[key] = _entry(f"actual return {lab_w} ÷ standard deviation of monthly returns",
             [[f"Monthly returns, {lab_w}", ", ".join(f"{x*100:+.1f}%" for x in arr), "t"],
-             ["Observations", arr.size, "d"], ["Compounded window return", cum, "%"],
+             ["Observations", arr.size, "d"],
+             ["Actual return = product of (1 + monthly return) − 1", cum, "%"],
              ["Standard deviation of monthly returns", sd, "%"]],
             "Trend-adjusted momentum", r, "n", m.get(key),
             f"the most recent month is skipped because it mean-reverts; at least {minobs} observations")
@@ -654,6 +668,13 @@ def expand(w: dict, f: dict) -> dict:
                 parts_sum = sum(v * wt for _, v, wt in f["w_ntm_parts"])
                 if row[1] is not None and not _close(parts_sum, row[1]):
                     e["ok"] = False              # the blend does not reproduce the EPS used
+                row = row[:3] + [kids]
+            elif label == "Consensus NTM revenue" and f.get("w_ntm_rev_parts"):
+                kids = [[f"FY ending {d} · consensus revenue {_money(v)} × weight {wt:.0%}",
+                         v * wt, "$"] for d, v, wt in f["w_ntm_rev_parts"]]
+                parts_sum = sum(v * wt for _, v, wt in f["w_ntm_rev_parts"])
+                if row[1] is not None and not _close(parts_sum, row[1]):
+                    e["ok"] = False              # the blend does not reproduce the revenue used
                 row = row[:3] + [kids]
             elif label.startswith("Own 5-year median") and f.get("w_hist_points"):
                 pts = f["w_hist_points"]

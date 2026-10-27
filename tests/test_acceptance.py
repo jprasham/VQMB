@@ -36,13 +36,13 @@ def check_blank(label, got):
 
 # ---------------------------------------------------------------------------
 def test_aura_walkthrough():
-    """Handbook §3, flux-2.1. Value raw 60 -> V=71; quality = plain mean of
+    """Handbook §3. Value raw 60 -> V=71; quality = plain mean of
     six percentiles -> Q=74; biz raw 81 -> B=89; strength 58 x cred damp
     (cred 70) -> 49 -> P=58. Then the three profile composites."""
 
     six = pd.DataFrame({k: [v] for (k, _), v in zip(C.QUALITY_METRICS, (75, 75, 75, 78, 78, 78))})
     q = R.build_pillars(pd.DataFrame(index=[0]), six)
-    check("quality raw = mean of six (engine 75s, shield 78s)",
+    check("quality raw = mean of six (75s and 78s)",
           float(q["quality_raw"].iloc[0]), 76.5, 1e-9)
 
     cred_damp = C.CRED_FLOOR + C.CRED_SPAN * 70 / 100.0
@@ -74,32 +74,32 @@ def test_percentile():
 
 
 def test_blank_reweighting():
-    pcts = pd.DataFrame({"v1_ebit_ev": [80.0], "v2_gp_ev": [60.0],
-                         "v3_fwd_earn_yield": [np.nan], "v4_norm_ep": [40.0],
-                         "v5_ev_sales_vs_hist": [np.nan]})
-    cols = [k for k, _ in C.VALUE_METRICS]
-    # VQMB rule: each blank lens counts as the neutral 50, mean over all five
-    got = float(R.block_mean(pcts, cols).iloc[0])
-    check("two of five lenses blank -> each counts as 50", got, (80 + 60 + 50 + 40 + 50) / 5)
-    # the FLUX rule is still there behind the switch
-    orig = C.METRIC_NEUTRAL_FILL_ON
+    pcts = pd.DataFrame({"v1_ebit_ev": [80.0, np.nan], "v2_gp_ev": [60.0, np.nan],
+                         "v3_fwd_earn_yield": [np.nan, np.nan], "v4_norm_ep": [40.0, np.nan],
+                         "v5_ev_sales_vs_hist": [np.nan, np.nan]})
+    # a blank lens counts as the neutral 50 when the pillar has real data
+    p = R.build_pillars(pd.DataFrame(index=pcts.index), pcts)
+    check("two of five lenses blank -> each counts as 50",
+          float(p["value_raw"].iloc[0]), (80 + 60 + 50 + 40 + 50) / 5)
+    check_blank("no lens at all -> the pillar stays blank", float(p["value_raw"].iloc[1]))
+    # switched off (None): the blanks drop out and the rest reweight
+    orig = C.MISSING_METRIC_FILL
     try:
-        C.METRIC_NEUTRAL_FILL_ON = False
-        got = float(R.block_mean(pcts, cols).iloc[0])
-        check("switch off (FLUX): mean of the three present", got, 60.0)
+        C.MISSING_METRIC_FILL = None
+        p = R.build_pillars(pd.DataFrame(index=pcts.index), pcts)
+        check("switch off: mean of the three present", float(p["value_raw"].iloc[0]), 60.0)
     finally:
-        C.METRIC_NEUTRAL_FILL_ON = orig
+        C.MISSING_METRIC_FILL = orig
 
 
 def test_biz_momentum_neutral_fill():
-    cols = [k for k, _ in C.BIZ_METRICS]
     b = pd.DataFrame({"b1_vs_trend": [np.nan, np.nan, np.nan, 90.0],
                       "b2_sequential": [80.0, np.nan, np.nan, 70.0],
-                      "b3_margin_delta": [60.0, 30.0, np.nan, 20.0]})
-    got = R.block_mean(b, cols).tolist()
-    check("B1 blank -> (50 + B2 + B3) / 3", got[0], (50 + 80 + 60) / 3)
+                      "b3_margin_delta": [90.0, 30.0, np.nan, 20.0]})
+    got = R.build_pillars(pd.DataFrame(index=b.index), b)["biz_raw"].tolist()
+    check("B1 missing, B2 80, B3 90 -> (50 + 80 + 90) / 3", got[0], (50 + 80 + 90) / 3)
     check("B1, B2 blank -> (50 + 50 + B3) / 3", got[1], (50 + 50 + 30) / 3)
-    check("all three blank -> 50", got[2], 50.0)
+    check_blank("all three blank -> blank, never a made-up 50", got[2])
     check("none blank -> plain mean", got[3], (90 + 70 + 20) / 3)
 
 
@@ -226,7 +226,7 @@ def test_quality_is_one_block_and_price_dampener_only_costs():
                          "p4_continuity": [100.0, 0.0], "p5_lottery": [100.0, 0.0],
                          "p6_down_resilience": [100.0, 0.0]})
     p = R.build_pillars(raw, pcts)
-    check("flux-2.1: strong protection adds score - mean of six",
+    check("strong protection adds score - mean of six",
           float(p["quality_raw"].iloc[0]), 90.0)
     check("weak protection costs in proportion", float(p["quality_raw"].iloc[1]), 40.0)
     check("perfect credibility -> price raw equals strength",
